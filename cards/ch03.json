@@ -1,0 +1,806 @@
+[
+  {
+    "id": "ch03-001",
+    "chapter": 3,
+    "section": "Introduction",
+    "title": "Why a billion users' photos need object storage",
+    "body": "Picture an app with 1 billion users uploading hundreds of millions of photos and videos daily. Each file is large, written once, read heavily for a few days, then almost never touched. Nobody edits a photo in place; a filter creates a new file. A database is the wrong home, and a disk on one server is too small, dies with the server, and serves only one machine. The right home is object storage: a system that keeps trillions of immutable blobs, never loses them, serves them over HTTP, and costs little per byte.",
+    "deeper": "The access pattern is the whole argument. Write-once data removes the need for in-place updates, which are the hardest thing a storage system does. Read-many-then-cold data means most bytes sit idle, so the cost per stored byte matters far more than raw speed for the long tail. Serving over HTTP means any client anywhere can fetch a blob without mounting a disk or talking to a specific server. A locally attached disk fails all three tests: capacity is bounded by one machine, durability is bounded by one machine's lifetime, and access is bounded to one machine's network interface. The chapter walks through the object model first, then Amazon S3 in depth, since S3 defined the category, and then compares how Google, Microsoft, Meta, Dropbox, Backblaze and open-source projects solved the same problem with different trade-offs. Keep this photo app in mind: nearly every design choice later in the chapter, from erasure coding to age-based storage tiers, is a response to exactly this shape of workload.",
+    "quiz": {
+      "q": "Why is a disk attached to a single server a poor home for user photos at this scale?",
+      "a": "It is too small, the data dies with the server, and only one machine can read it. Object storage offers huge capacity, durability and HTTP access for anyone."
+    }
+  },
+  {
+    "id": "ch03-002",
+    "chapter": 3,
+    "section": "3.1 The object model",
+    "title": "Buckets, keys, objects: the whole data model in three words",
+    "body": "An object is a blob of bytes plus a little metadata: content type, size, checksum and user-defined key-value tags. Objects live in a bucket, a named container with its own settings such as region, access policy, versioning, lifecycle rules and encryption. Inside a bucket, each object is identified by a key, which is simply a string, for example photos/2026/09/26/user-123/img-9f2c.jpg. That is the entire model: bucket plus key gives you one object, and you read or replace it as a whole.",
+    "deeper": "Because policy lives on the bucket, the bucket is the unit where you decide the important operational questions: which region holds the data, who can read it, whether overwrites keep old versions, when data moves to cheaper tiers or expires, and how it is encrypted. Designing buckets is therefore partly a governance exercise. Teams often split data into different buckets not because of size but because the data needs different retention or access rules. The key, by contrast, carries no settings at all. It is just the name you use to look the object up. Its structure is up to you, and that choice turns out to matter a lot for performance: S3 partitions its index by key range, so the way you shape keys decides how load spreads across partitions. The metadata attached to an object is small by design. It describes the blob, it does not replace a database. Anything you want to search by later, such as the owning user or a content label, should also live in a separate index that maps those attributes to keys.",
+    "quiz": {
+      "q": "Which settings belong to a bucket rather than to an individual key?",
+      "a": "Region, access policy, versioning, lifecycle rules and encryption. The key is only a string name for one object."
+    }
+  },
+  {
+    "id": "ch03-003",
+    "chapter": 3,
+    "section": "3.1 The object model",
+    "title": "S3 folders are an illusion: the namespace is flat",
+    "body": "In S3 general purpose buckets, the slashes in a key only look like folders. There are no real directories: the key is one opaque string. When a console shows folders, it is really running a list request with a prefix, such as photos/2026/, and a delimiter, such as /, then grouping the results. There is no directory object you can rename, lock or delete. So renaming a folder in S3 means copying every object to a new key and deleting the old ones.",
+    "deeper": "This design is a deliberate simplification. A real hierarchical filesystem must maintain directory entries, keep parent and child consistent, and support atomic renames of whole subtrees. Each of those is a coordination problem that gets much harder when the namespace holds hundreds of trillions of entries spread over many machines. A flat key space avoids all of it: the index is just a giant sorted map from key to location, which is easy to partition by key range. The price shows up in operations people expect from filesystems. A folder rename is not one metadata change but N copies plus N deletes, which is slow, costly and not atomic, so a reader might see half the objects under the old prefix and half under the new one. Tools that treat S3 as a filesystem hide this cost until a large rename takes hours. Note the exception later in the chapter: S3 Express One Zone uses directory buckets, which do have a real hierarchical namespace and return list results unsorted. The flat model applies to general purpose buckets.",
+    "quiz": {
+      "q": "Why is renaming a 'folder' in an S3 general purpose bucket expensive?",
+      "a": "There is no directory object. The folder is only a key prefix, so every object must be copied to a new key and the old one deleted."
+    }
+  },
+  {
+    "id": "ch03-004",
+    "chapter": 3,
+    "section": "3.1 The object model",
+    "title": "Immutable objects: no byte-level edits, no write races",
+    "body": "An object is immutable: you cannot change byte 500 of an existing object. You can only replace the whole object with a new PUT, or delete it. This single rule removes a whole class of concurrency bugs. Two writers can never interleave bytes inside one object, because neither can write a partial region. If two clients upload to the same key, each upload is a complete object, and the last complete PUT wins. Readers always see one whole version, never a mix.",
+    "deeper": "Compare this with a shared file on a normal filesystem, where two processes writing different offsets at the same time can leave a file that belongs to neither writer. Preventing that needs locks, leases or careful protocols, all of which are hard to run across a global fleet. Object storage sidesteps the problem by refusing to offer partial writes at all. The only unit of change is an entire object, so the system only needs to decide which complete version is current. Last-writer-wins is simple, but it does mean a slower upload can silently replace a faster, newer one if both target the same key. That is one reason later features matter: versioning keeps every PUT as its own version so nothing is lost, and conditional writes, added to S3 in 2024, let a client say 'only write if the key does not exist' or 'only write if it has not changed', giving compare-and-swap on top of the immutable model. Applications that need true in-place edits, like database data files, belong on block storage instead.",
+    "quiz": {
+      "q": "If two clients PUT the same key at the same time, what can a reader see?",
+      "a": "One complete object, from whichever PUT finished last. Bytes can never interleave because partial writes are impossible."
+    }
+  },
+  {
+    "id": "ch03-005",
+    "chapter": 3,
+    "section": "3.1 The object model",
+    "title": "Why immutability makes caching and erasure coding easy",
+    "body": "Immutability simplifies more than concurrency. A cached or replicated copy of a given version is never slightly stale: it is either exactly the right version or a different version. Erasure coding also becomes cheap, because the system cuts an object into pieces and computes parity once, at write time, and never recomputes it for a small change. The cost: object storage fits poorly for workloads that modify small parts of large files, such as database data files. Those belong on block storage.",
+    "deeper": "Erasure coding stores data pieces plus parity pieces so that lost pieces can be rebuilt. If data could be edited in place, every small write would force the system to read the old data and old parity, compute new parity, and write both back, which is the expensive small-write penalty described in Chapter 2. With immutable objects, parity is computed exactly once and never touched again, so the storage-efficient encoding comes almost for free. Caching benefits in a similar way. Invalidation is famously hard because a cached copy can drift from the source bit by bit. When a version can never change, a cache only has to know which version is current; any copy of that version is byte-for-byte correct. Replication across regions is equally simple: ship the whole new version, never a stream of partial patches that must be applied in order. The trade-off is real, though. A database that rewrites 8 KB pages inside a multi-gigabyte file would have to rewrite the entire object for every change, which is why databases use block storage, covered in Chapter 4.",
+    "quiz": {
+      "q": "Why does immutability make erasure coding cheaper for object stores?",
+      "a": "Parity is computed once at write time. Without in-place updates, the system never has to read, recompute and rewrite parity for small changes."
+    }
+  },
+  {
+    "id": "ch03-006",
+    "chapter": 3,
+    "section": "3.1 The object model",
+    "title": "System metadata, user metadata, and changeable tags",
+    "body": "Objects carry two kinds of metadata. System metadata is set by the service: size, last-modified time, ETag, storage class and encryption state. The ETag is an identifier of the content, often an MD5 hash for simple uploads. User metadata is small key-value pairs you attach at upload time. S3 also supports object tags, which differ in one key way: you can change tags later without rewriting the object, and lifecycle and access policies can act on them.",
+    "deeper": "The distinction matters because metadata follows the immutability rule unevenly. User metadata is fixed at upload; changing it effectively means writing the object again. Tags are the escape hatch: they are mutable labels stored alongside the object, cheap to update, and usable as selectors. For example, a lifecycle rule can move or expire only objects tagged in a certain way, and an access policy can grant or deny access based on a tag. The ETag is worth understanding precisely. For simple uploads it is often the MD5 of the content, which makes it useful for checking integrity or detecting change. It is not guaranteed to be an MD5 for every upload type, so treat it as an opaque content identifier. It also powers conditional requests: an If-Match with an ETag lets a write fail if the object has changed since you read it. Storage class and encryption state in system metadata tell you where and how the bytes physically live, which ties each object to the pricing and protection it gets.",
+    "quiz": {
+      "q": "What can object tags do that user metadata cannot?",
+      "a": "Tags can be changed later without rewriting the object, and lifecycle and access policies can use them. User metadata is fixed at upload."
+    }
+  },
+  {
+    "id": "ch03-007",
+    "chapter": 3,
+    "section": "3.1 The object model",
+    "title": "Common mistake: using S3 metadata as a query engine",
+    "body": "A frequent error is treating object metadata as something you can search. You cannot ask S3 to return all objects where user-tag equals cat. S3 listing works only by key prefix. Metadata and tags describe an object once you know its key; they do not help you find keys. Big companies solve this by keeping a separate index, such as a database table or an Iceberg table, that maps business attributes like user, date or label to object keys.",
+    "deeper": "The root cause is how the index layer is built. S3's metadata layer is a sharded key-value map keyed by bucket, key and version, partitioned by key range. It can answer 'what is at this key' and 'which keys start with this prefix' efficiently, because those are range lookups on a sorted map. It has no secondary indexes on tags or user metadata, so a query by attribute would mean reading every object's metadata, which at billions of objects is impractical. The fix is architectural: write to the object store and to a queryable index as part of the same upload pipeline. The object store keeps the bytes durably and cheaply; the database or table format keeps the attributes and answers queries, returning keys that you then GET. This separation also fixes listing costs, since you rarely need to enumerate the bucket if the index already knows every key. Designing that index early saves painful backfills later, when someone asks for all photos of cats uploaded last year and discovers the only option is a full scan.",
+    "quiz": {
+      "q": "How do large companies find objects by business attributes if S3 cannot query tags?",
+      "a": "They keep a separate index, such as a database or Iceberg table, mapping attributes to object keys, then fetch by key."
+    }
+  },
+  {
+    "id": "ch03-008",
+    "chapter": 3,
+    "section": "3.1 The object model",
+    "title": "Versioning: the cheapest undo button for deletes",
+    "body": "With versioning on, every PUT to a key creates a new version ID instead of overwriting. A DELETE without a version ID does not remove data. It adds a delete marker, which hides the object from normal reads, while older versions stay readable and restorable. Versioning is the cheapest protection against a bug or a person that deletes or overwrites data. The cost is storage: old versions are billed until a lifecycle rule expires them.",
+    "deeper": "Versioning turns destructive operations into reversible ones. A buggy job that overwrites a million objects with empty files, or an engineer who runs a delete against the wrong prefix, leaves every previous version intact. Recovery means removing the delete markers or copying the prior version back to the top. This matters because, as the chapter argues later, most real data loss comes from software and people rather than simultaneous disk failures. Erasure coding cannot help if the system faithfully stores the wrong instruction; versioning can. The billing side is where teams get surprised. A bucket with frequent overwrites can quietly accumulate many times its visible size in noncurrent versions, all charged at normal rates. The standard pattern is a lifecycle rule that expires noncurrent versions after a chosen window, giving a safety net measured in days or weeks without paying forever. Note that a DELETE that specifies a version ID does permanently remove that version, so access to versioned deletes is itself something to restrict.",
+    "quiz": {
+      "q": "What happens when you DELETE a key without a version ID in a versioned bucket?",
+      "a": "No data is removed. S3 adds a delete marker that hides the object from normal reads; older versions remain restorable."
+    }
+  },
+  {
+    "id": "ch03-009",
+    "chapter": 3,
+    "section": "3.1 The object model",
+    "title": "Multipart upload: never restart a 20 GB upload at 19 GB",
+    "body": "Uploading a 20 GB video in one HTTP request is fragile: if the connection breaks at 19 GB, you start over. Multipart upload fixes this. The client calls CreateMultipartUpload, uploads parts in parallel, retrying any failed part on its own, and then calls CompleteMultipartUpload with the list of parts. S3 then makes the whole object appear atomically. Parallel parts also raise throughput, since several connections carry data at once.",
+    "deeper": "Current S3 limits are 1 to 10,000 parts, each part 5 MiB to 5 GiB, with the last part allowed to be smaller, and a maximum object size of 48.8 TiB. AWS suggests using multipart once objects reach about 100 MB. The atomic completion step preserves the immutable model: readers never see a half-assembled object. Until CompleteMultipartUpload succeeds, the object simply does not exist at that key. The trap is abandoned uploads. Parts from an upload that was never completed or aborted are invisible in normal listings, yet they are still stored and still billed. A fleet of clients that crash mid-upload can accumulate a large hidden bill over months. The fix is simple and should be default for every bucket: add a lifecycle rule with AbortIncompleteMultipartUpload, which cleans up uploads left unfinished after a set number of days. Part size is also a tuning knob. Smaller parts mean cheaper retries and more parallelism but more requests; with the 10,000-part cap, very large objects force larger parts.",
+    "quiz": {
+      "q": "Why should every bucket have an AbortIncompleteMultipartUpload lifecycle rule?",
+      "a": "Incomplete uploads are invisible in listings but their parts are still billed. The rule cleans them up automatically."
+    }
+  },
+  {
+    "id": "ch03-010",
+    "chapter": 3,
+    "section": "3.1 The object model",
+    "title": "Conditional writes: S3 finally got compare-and-swap in 2024",
+    "body": "For many years S3 had no compare-and-swap. Since 2024 it supports conditional writes. A PUT with If-None-Match: * fails with 412 Precondition Failed if the key already exists. A PUT with If-Match and an ETag fails if the object has changed since that ETag. When several conditional writes race on one key, the first to finish wins and the rest get 412. This lets table formats and coordination protocols build atomic create-if-absent steps directly on S3.",
+    "deeper": "Before this feature, anything that needed mutual exclusion on S3 had to bring its own lock service. A table format committing a new snapshot, for instance, must ensure that two writers cannot both claim the same next version. Without an atomic check, both could write and one commit would silently overwrite the other. Teams used external databases or coordination systems purely to arbitrate these commits, which added cost, latency and another thing that could fail. With If-None-Match: *, a writer can try to create the next metadata file and learn from a 412 that someone else got there first, then retry on top of the new state. If-Match gives optimistic concurrency for updates: read an object, note its ETag, and write back only if nobody changed it in between. The feature is small in API terms but large in effect, because it moves a coordination primitive into the storage layer itself. The chapter later warns that S3-compatible systems vary in whether they support newer APIs like this, so test before relying on it elsewhere.",
+    "quiz": {
+      "q": "How does If-None-Match: * let a table format avoid an external lock service?",
+      "a": "It makes a PUT fail with 412 if the key exists, so only one writer can create a given commit file; losers detect the conflict and retry."
+    }
+  },
+  {
+    "id": "ch03-011",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "S3 by the numbers: 280 trillion objects, 100M requests/sec",
+    "body": "Amazon S3 launched on March 14, 2006, and defined the object storage category. By 2023, Andy Warfield described it as hundreds of microservices storing data on millions of hard drives, holding over 280 trillion objects and serving over 100 million requests per second on average. AWS has never published a full design paper for S3, so everything known about its internals comes from what AWS engineers have shared in papers, blog posts and talks.",
+    "deeper": "These numbers frame every design choice that follows. At 280 trillion objects, any per-object overhead in metadata is multiplied into an enormous cost, which is why the index layer is its own distributed system. At over 100 million requests per second on average, the front end must be stateless and horizontally scalable, and no single component can sit on the hot path for all requests without being partitioned. Millions of hard drives means drive failures are not rare events but a constant background condition, so durability has to come from redundancy plus continuous repair rather than from reliable hardware. The phrase 'hundreds of microservices' is also telling: S3 is not one program but a large set of services, including placement, repair, auditing, lifecycle, replication and billing, around a core of front end, index and storage. The lack of a full design paper means you should be careful with claims about S3 internals. This chapter sticks to what AWS engineers have stated, notably Warfield and Werner Vogels's blog posts and the SOSP 2021 ShardStore paper, and labels illustrative numbers as assumptions.",
+    "quiz": {
+      "q": "Why does S3's scale force durability to come from repair rather than reliable hardware?",
+      "a": "With millions of drives, failures happen constantly. Only redundancy plus continuous detection and repair can keep data safe."
+    }
+  },
+  {
+    "id": "ch03-012",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "S3's three layers: front end, index, storage fleet",
+    "body": "Conceptually, S3 has three layers. The front end is a fleet of stateless web servers that terminate HTTPS, authenticate each request by checking signatures and evaluating IAM and bucket policies, and route it. The index layer is a distributed, sharded key-value system mapping bucket, key and version to where the bytes live, plus system metadata; every GET, PUT, DELETE and LIST touches it. The storage layer is a huge fleet of hard-drive nodes holding the actual data shards, running software called ShardStore.",
+    "deeper": "Separating these layers lets each scale on its own axis. The front end scales with request rate and authentication work, and because it is stateless, any server can handle any request, so adding capacity is just adding machines. The index scales with object count and metadata operations. It is sharded by key range, which is why key design affects performance: a hot key range means a hot index partition. The storage layer scales with bytes and disk I/O, and its main concern is spreading load and surviving drive failures. Around these three layers run many background services: placement decides where new shards go, repair rebuilds lost shards, auditing verifies stored data, lifecycle moves or expires objects, replication copies data across regions, and billing meters usage. The architecture diagram in the chapter also shows a witness component beside the index that tracks the latest write per object; it was added in 2020 to deliver strong consistency. This split between a metadata layer and an immutable data layer recurs in Azure, Colossus and Meta's systems as well.",
+    "quiz": {
+      "q": "Why does every S3 GET, PUT, DELETE and LIST touch the index layer?",
+      "a": "The index maps bucket, key and version to where the bytes live. No operation can find or commit data without it."
+    }
+  },
+  {
+    "id": "ch03-013",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Write data first, index last: the commit point trick",
+    "body": "A PUT in S3 flows roughly like this: the front end authenticates the request, the data is cut into shards and written to storage nodes spread across Availability Zones, and only after the data is durable is the index entry written. That order is essential. If the index pointed to data not yet safely stored, a crash could expose a live object with missing bytes. Writing data first and metadata last makes the index entry the commit point.",
+    "deeper": "This is a classic pattern in storage systems: the last atomic step of a write defines whether the write happened. Before the index entry exists, the object is invisible to every reader, no matter how many shards are already on disk. After the index entry exists, the data is guaranteed to be durable because it was written first. A crash between the two steps leaves shards that no index entry references. That is harmless: it is just unreferenced garbage, and background cleanup removes it later. The reverse order would be dangerous. A crash after writing the index but before the data is durable would publish an object that cannot be fully read, which is a form of silent data loss from the customer's view. The same principle explains multipart upload's atomic completion and appears across the systems in this chapter. The key takeaways state it directly: every large object store separates a metadata or index layer from an append-only data layer, and commits a write by writing the index entry last.",
+    "quiz": {
+      "q": "What does a crash between writing shards and writing the index leave behind?",
+      "a": "Only unreferenced shards, which are invisible to readers and removed by background cleanup. No partially readable object is exposed."
+    }
+  },
+  {
+    "id": "ch03-014",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "ShardStore: S3's Rust rewrite of its bottom layer",
+    "body": "ShardStore is the key-value store running on every S3 storage node, holding the shards of object data. It was a rewrite of S3's bottom-most layer, written in Rust for type safety. The SOSP 2021 paper describes it as a log-structured design that must survive crashes at any moment, while the team keeps adding features. That combination, crash safety plus constant change, is exactly where storage engines tend to develop subtle bugs that only appear under rare timing.",
+    "deeper": "Log-structured means new data is appended rather than written in place, which suits hard drives and immutable shards, but it brings its own complexity: indexes over the log, garbage collection of dead data, and recovery after a crash must all agree on what state is valid. Every one of those paths has to be correct when power disappears at any instant, including in the middle of a metadata update or a compaction step. Choosing Rust addressed a class of memory-safety and type errors at compile time, but language safety does not prove that crash recovery logic is right. The bigger story in the paper is how AWS gained confidence in correctness without full formal proofs, which would be too expensive for a large, fast-changing engine. The approach, called lightweight formal methods, is covered in the next cards: an executable reference model, property-based testing against it, and model checking of concurrent code. The fact that the team kept adding features is central, because any verification method that cannot keep up with change eventually stops being used.",
+    "quiz": {
+      "q": "Why is a crash-safe storage engine that keeps gaining features especially bug-prone?",
+      "a": "Every new feature adds code paths that must stay correct if a crash happens at any instant, creating rare timing bugs that ordinary tests miss."
+    }
+  },
+  {
+    "id": "ch03-015",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Lightweight formal methods: a 1% model checks the real code",
+    "body": "Full formal proofs of a large, fast-changing storage engine are too expensive, so the ShardStore team used lightweight formal methods. They wrote an executable reference model of ShardStore in Rust: a simple, obviously correct version of the same API, about 1% of the real system's size. Then property-based testing generated millions of random operation sequences, including puts, gets, deletes, crashes, restarts and disk failures, and checked that the real system and the model always agreed.",
+    "deeper": "The reference model works because correctness is easier to state than to implement efficiently. The model can use a plain in-memory map with none of the real engine's log structure, caching or on-disk layout, so it is small enough to be obviously right. The real system is then judged against it: after any sequence of operations, the observable results must match. Property-based testing supplies the sequences. Instead of engineers hand-writing test cases, a tool generates random combinations, including nasty ones like crashing midway through a write and then restarting, which are exactly the situations humans forget to test. When a mismatch appears, the tool reports a failing sequence the team can debug. A third technique targeted concurrency: model checking of concurrent code explored many thread interleavings to find crash-consistency and concurrency bugs that random testing might rarely hit. Together these give much of the confidence of a proof at a small fraction of the cost, and, crucially, they run continuously as ordinary tests rather than as a one-time academic exercise.",
+    "quiz": {
+      "q": "How does property-based testing use the reference model to find bugs?",
+      "a": "It generates random operation sequences, including crashes and disk failures, runs them on both, and flags any case where the real system disagrees with the model."
+    }
+  },
+  {
+    "id": "ch03-016",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "16 bugs stopped before production, by non-experts",
+    "body": "The SOSP 2021 ShardStore paper reports that lightweight formal methods prevented 16 issues from reaching production, including subtle crash-consistency and concurrency bugs. Just as important, normal engineers, not formal-methods specialists, kept the checks updated as features were added. That second result is what makes the approach practical: verification that only experts can maintain decays as the code changes, while checks that every engineer updates alongside new features keep protecting the system.",
+    "deeper": "Crash-consistency bugs are among the most dangerous in storage because they can silently lose or corrupt data only after a specific crash at a specific moment, which may happen once in years across the fleet and be nearly impossible to reproduce afterwards. Catching 16 of these before shipping is a direct contribution to S3's durability, arguably as valuable as extra parity shards. The maintenance result addresses the usual objection to formal methods: that they are too specialized. Here the reference model is written in the same language as the production code, lives in the same repository, and runs as tests. An engineer adding a feature extends the model with the simple version of that feature, and the existing property-based tests immediately start exercising it. The chapter's senior staff lens draws the conclusion: the lesson is about cost, not mathematics. A reference model that is 1% of the code and runs in continuous integration every day beats a perfect proof that nobody maintains. The key takeaways repeat that normal engineers can maintain this and it catches real crash bugs.",
+    "quiz": {
+      "q": "Why does it matter that ordinary engineers maintained ShardStore's checks?",
+      "a": "Checks only protect code if they evolve with it. Expert-only verification decays as features are added; checks every engineer updates keep working."
+    }
+  },
+  {
+    "id": "ch03-017",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Design review question: what is your executable spec?",
+    "body": "The senior staff lesson from ShardStore is about cost, not math. A reference model that is 1% of the code and runs in continuous integration every day beats a perfect proof that nobody maintains. So in a design review for any new storage engine, ask one pointed question: what is your executable specification, and how do you check the real code against it under crashes? A team without an answer is relying on hand-written tests to catch timing bugs.",
+    "deeper": "The question is effective because it forces three things into the open. First, whether the team has written down, in runnable form, what correct behavior means. Many storage projects have only an informal understanding spread across people's heads, which makes correctness arguments impossible to check. Second, whether they test failure, not just success. Storage bugs hide in crash and restart paths, disk errors and concurrent operations; tests that only exercise the happy path say little about durability. Third, whether the checks are cheap enough to survive. A verification effort that needs a specialist, or takes days to run, will be skipped under deadline pressure and quietly rot. The ShardStore approach answers all three: an executable model in the production language, random operation sequences including crashes and disk failures, and model checking of concurrent code, all running as part of normal development. This connects to the chapter's broader durability argument: coding schemes protect against hardware, but formal checks on storage code protect against the software bugs that cause most real data loss.",
+    "quiz": {
+      "q": "Why prefer a maintained 1% reference model over a complete formal proof?",
+      "a": "The model runs in CI every day and evolves with the code. A perfect proof nobody maintains stops matching the system as features change."
+    }
+  },
+  {
+    "id": "ch03-018",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "S3's 14 years of eventual consistency and the workarounds",
+    "body": "For its first 14 years, S3 was eventually consistent for some operations. A PUT that overwrote an existing key, or a LIST right after a PUT, could return old results for a short time. That broke assumptions in data systems like Hadoop and Spark, which expect to see files they just wrote. Users had to add extra layers, such as Netflix's s3mper and the EMRFS consistent view, that tracked writes in a separate database to detect stale answers.",
+    "deeper": "Eventual consistency means that after a write, readers will eventually see it, but not necessarily right away. For many web workloads this is tolerable: a user uploading a new photo rarely notices if a list is briefly out of date. For analytics pipelines it is dangerous. A job that writes output files and then lists the directory to find them might miss some, and a downstream job might silently process incomplete data. An overwrite followed by a read might return the previous contents, leading to wrong results with no error. The workarounds all used the same idea: record every write in a separate, strongly consistent database, then compare what S3 returns against that record and wait or retry when they disagree. Netflix's s3mper and Amazon's own EMRFS consistent view are examples. They worked but cost money, added operational burden, and introduced a second source of truth that could itself drift. This history explains why the December 2020 change to strong consistency was such a significant event for the data ecosystem built on S3.",
+    "quiz": {
+      "q": "Why did eventual consistency hurt Hadoop and Spark jobs on S3?",
+      "a": "A LIST or read right after a write could return old results, so jobs could miss newly written files or read stale data without any error."
+    }
+  },
+  {
+    "id": "ch03-019",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Dec 2020: strong consistency for free, and the stale cache",
+    "body": "In December 2020, S3 became strongly consistent for all GET, PUT, LIST and DELETE operations, at no extra cost and with no performance change. The obstacle had been a metadata cache. S3 served its metadata through a cache that made reads fast but could return a stale view after an overwrite. Simply removing the cache would have hurt performance at S3's scale. Instead, AWS built a cache coherence protocol so the cache could stay and still never serve outdated answers.",
+    "deeper": "Strong consistency here means read-after-write: once a PUT or DELETE succeeds, every later GET and LIST reflects it. The difficulty was not the storage layer but the speed trick in front of the index. Caching metadata is how a system handling over 100 million requests per second keeps the index from being hammered by repeated lookups. But a cache that learns about changes only after some delay is precisely what produces eventual consistency. AWS had two obvious options and rejected both. Dropping the cache would make every read go to the index, a large performance and cost hit. Keeping the cache as it was would leave the consistency gap. The chosen path, a coherence protocol, keeps the cache in the read path but gives it a cheap way to check freshness. Werner Vogels later described how this worked, and the next card covers the key component, the witness. The phrase 'no extra cost and no performance change' is the remarkable part: customers got a stronger guarantee without paying for it in latency or price.",
+    "quiz": {
+      "q": "Why didn't AWS just remove the metadata cache to fix consistency?",
+      "a": "Removing it would have hurt read performance at huge scale. A coherence protocol kept the cache fast while making it detect staleness."
+    }
+  },
+  {
+    "id": "ch03-020",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "The witness: a tiny in-memory read barrier for S3's cache",
+    "body": "The heart of S3's consistency fix is a new component called the witness, which tracks changes to object metadata. On a read, the metadata cache checks with the witness, which acts like a read barrier: it lets the cache learn whether its view of an object is stale. If a newer version exists, the cache fetches it before answering. The witness keeps only in-memory state, so the check is fast enough to sit on the read path of every request.",
+    "deeper": "The sequence diagram in the chapter shows the flow. A writer sends PUT key v2 through the front end, the index store commits v2, and the witness notes that a new version exists for that key. Later a reader sends GET key. The metadata cache holds v1, so it asks the witness whether v1 is still the latest. The witness answers no, a newer version exists; the cache fetches v2 from the index and returns v2 to the reader. The design is clever because the witness does not store full metadata or data. It only needs enough information to answer 'is this view current?', which keeps it small and entirely in memory. A cache hit that the witness confirms is still fast; only stale entries pay the extra fetch. This preserves the performance benefit of caching while closing the window that caused eventual consistency. In the key takeaways, the chapter summarizes it as a cache coherence protocol in which a witness acts as a read barrier so caches learn when they are stale.",
+    "quiz": {
+      "q": "What does the witness store, and why does that keep reads fast?",
+      "a": "Only in-memory state about the latest change per object. Caches do a quick freshness check and fetch from the index only when stale."
+    }
+  },
+  {
+    "id": "ch03-021",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Ordering writes and proving it: verification beat coding",
+    "body": "For the witness to work, S3 needed a clear order of operations for each object, so every component agrees which write is latest. Rather than build ordering from scratch, AWS reused its existing replication logic, originally built for event notifications and cross-region replication, to provide that order. AWS then verified the coherence algorithm with deductive proofs and model checking, and said this verification work was larger than the implementation work itself.",
+    "deeper": "Per-object ordering is the foundation of any consistency claim. If two PUTs to the same key could be seen in different orders by the witness and the index, the witness might tell a cache that an older version is current, and strong consistency would silently fail. Reusing replication logic was a practical choice: that machinery already had to establish order in order to deliver notifications and replicate changes correctly, so it was battle-tested at S3's scale. The verification effort is the notable cultural signal. Consistency protocols are notoriously easy to get subtly wrong, with bugs that appear only under rare interleavings of concurrent reads, writes and failures. By applying deductive proofs to the algorithm and model checking to explore behaviors, AWS treated the protocol as something that must be shown correct, not merely tested. Spending more on verification than on implementation fits the same philosophy as ShardStore's lightweight formal methods: for core storage correctness, the proof or check is the real product, and the code is the easier part.",
+    "quiz": {
+      "q": "Why does strong consistency require a clear per-object order of operations?",
+      "a": "Components must agree which write is latest. Without a single order, the witness could vouch for an older version and readers would see stale data."
+    }
+  },
+  {
+    "id": "ch03-022",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Strongly consistent always has a scope: read the scope",
+    "body": "Google Cloud Storage has long offered strong global consistency for read-after-write, read-after-delete and listing. Yet its documentation still lists two exceptions: objects cached by public caches can be stale until their cache lifetime ends, and IAM permission changes are eventually consistent, typically taking about a minute. S3 also has eventually consistent corners, such as bucket configuration changes. The lesson: a strongly consistent label always covers a specific set of operations, never everything.",
+    "deeper": "This matters in practice because bugs often appear exactly at the boundaries of a guarantee. An application might correctly assume that a newly uploaded object is readable immediately, then fail because a permission granted a few seconds earlier has not yet propagated, or because a CDN or public cache still serves an older copy. Similarly, changing an S3 bucket's configuration and immediately depending on the new behavior can surprise you, since bucket configuration is outside the strong consistency scope. The engineering habit to build is to read a provider's consistency documentation as a list of covered operations and a list of exceptions, then map your application's critical paths onto both lists. If a path depends on something eventually consistent, such as permissions, design for delay: retry with backoff, or verify before proceeding. For caches outside the storage service, control freshness with cache lifetimes or new keys per version, which is easy with immutable objects. The phrase from the chapter is worth remembering verbatim: strongly consistent always has a scope. Read the scope.",
+    "quiz": {
+      "q": "Name two things that remain eventually consistent even in Google Cloud Storage.",
+      "a": "Objects served from public caches until their cache lifetime ends, and IAM permission changes, which typically take about a minute."
+    }
+  },
+  {
+    "id": "ch03-023",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "11 nines: lose one of 10 million objects per 10,000 years",
+    "body": "S3 Standard is designed for 99.999999999%, or 11 nines, of annual durability. In plain terms, if you store 10 million objects, you can expect to lose one object about once every 10,000 years. The puzzle is that S3 is built from hard drives, which fail every day across a fleet of millions. The chapter explains four ingredients: erasure coding across Availability Zones, continuous auditing and repair, end-to-end checksums, and engineering process and culture.",
+    "deeper": "Durability is the probability that data you stored is still intact and retrievable later, which is different from availability, the probability you can reach it right now. Eleven nines means the expected annual loss rate per object is about one in 100 billion, which is how the 10 million objects and 10,000 years framing works out. No individual component comes close: a single drive's failure rate is many orders of magnitude worse. The number is achieved by combining independent protections so that losing data requires several unlikely events to line up before repair catches them. Note the word designed: 11 nines is a design target based on models of failure and repair, not a measured guarantee. It also mainly describes protection against hardware failure. The chapter stresses that most real data loss comes from software bugs and human mistakes, which is why process, formal checks and features like versioning are counted as part of the durability story, not add-ons. The following cards take each ingredient in turn, starting with erasure coding across Availability Zones.",
+    "quiz": {
+      "q": "How can 11 nines of durability come from drives that fail daily?",
+      "a": "By combining erasure coding across AZs, fast detection and repair, end-to-end checksums and careful process, so loss needs several unlikely events before repair."
+    }
+  },
+  {
+    "id": "ch03-024",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Reed-Solomon across AZs: any k of k+m shards rebuild it",
+    "body": "S3's first durability ingredient is Reed-Solomon erasure coding. An object is split into k data shards plus m parity shards, and any k of the k + m shards can rebuild the whole object. So up to m shards can be lost without losing data. S3 places shards on different drives and different hosts, and for regional storage classes, across at least three Availability Zones, which are separate data center groups. AWS does not publish its exact values of k and m.",
+    "deeper": "Erasure coding beats plain replication on cost. Keeping three full copies uses 3x the raw storage and tolerates losing two copies. An erasure code can tolerate a similar number of failures with far less overhead, because parity shards are mathematically derived rather than full duplicates; the overhead is (k + m) / k. Placement is what turns the code into real durability. If several shards of one object sat on the same drive or host, one failure could remove several shards at once, defeating the math. Spreading shards across drives, hosts and Availability Zones makes failures closer to independent, so losing more than m shards requires unrelated events to coincide. Spreading across at least three AZs also means the design aims to survive the loss of an entire zone, such as a building-level power or network failure. That requirement shapes the choice of k and m, as the next card's illustrative math shows. Remember that immutability makes this cheap: parity is computed once at write time and never updated.",
+    "quiz": {
+      "q": "Why does shard placement matter as much as the erasure code itself?",
+      "a": "If shards share a drive, host or AZ, one failure removes several at once. Spreading them keeps failures independent so losing more than m is unlikely."
+    }
+  },
+  {
+    "id": "ch03-025",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "The AZ-loss math: why 9+3 fails and 8+4 survives",
+    "body": "Using an assumed scheme, not AWS's real numbers: take 9 data plus 3 parity shards spread evenly over 3 Availability Zones, 4 shards per zone. Storage overhead is 12 / 9 = 1.33x, versus 3x for three full copies. But losing one whole zone removes 4 shards, leaving 8, fewer than the 9 needed. So this layout cannot survive an AZ loss. An 8 data plus 4 parity scheme, overhead 1.5x, leaves exactly 8 shards after losing a zone and survives.",
+    "deeper": "The example exposes the core design tension of erasure coding in a multi-zone system. If you only care about random drive failures, you can use a wide stripe with little parity, because failures hit individual shards scattered across the fleet. But a zone outage removes a large, correlated block of shards at once: with shards spread evenly over three zones, one zone takes a third of them. To survive that, parity must be at least as large as the number of shards in one zone. That forces overhead up. In the example it rises from 1.33x to 1.5x. Even so, 1.5x is half the cost of three full copies at 3x, which is why erasure coding across zones remains attractive despite the extra parity. The same arithmetic lets you evaluate any scheme quickly: divide total shards by data shards for overhead, then subtract the per-zone shard count from the total and check it is still at least k. Keep in mind that AWS does not publish its real k and m; these numbers are purely for intuition.",
+    "quiz": {
+      "q": "Why does surviving a full AZ loss force more parity than surviving random drive failures?",
+      "a": "A zone outage removes all shards in that zone at once, so parity must cover a whole zone's share, not just a few scattered shards."
+    }
+  },
+  {
+    "id": "ch03-026",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Durability is a repair race, not a static code property",
+    "body": "S3's second durability ingredient is continuous auditing and repair. Durability is not fixed by the coding scheme alone; it depends on how quickly loss is detected and fixed. Background processes constantly read data, verify checksums, and rebuild missing or corrupted shards onto healthy drives. The faster the repair, the smaller the window in which a second and third failure can combine to lose data. That makes repair bandwidth a first-class design resource, not an afterthought.",
+    "deeper": "Chapter 2's durability model showed that mean time to repair appears in the denominator of the loss probability. Intuitively, data is only at risk while it is degraded: after one shard is lost and before it is rebuilt. If rebuilding takes a day, you need several more failures within that day to lose the object; if it takes an hour, the window shrinks roughly by a factor of 24. Halving repair time can do as much for durability as adding parity, and it costs no extra storage. That is why repair bandwidth, the network and disk capacity reserved for rebuilding, must be planned just like customer-facing capacity. Auditing matters because not all loss announces itself. A drive can fail loudly, but data can also rot silently through latent sector errors or bit corruption. Only by reading data back and verifying checksums can the system find these problems before a second failure makes them unrecoverable. The combination of constant scrubbing and fast rebuild keeps the degraded windows short across millions of drives.",
+    "quiz": {
+      "q": "Why can faster repair improve durability as much as adding parity?",
+      "a": "Data is only at risk while degraded. Shorter repair shrinks the window for further failures; mean time to repair sits in the denominator of loss probability."
+    }
+  },
+  {
+    "id": "ch03-027",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "End-to-end checksums: verify bytes at every hop",
+    "body": "S3's third durability ingredient is end-to-end checksumming. Data is checksummed when it is uploaded and verified at many points as it moves through the system and sits on disk. S3 now also lets clients send additional checksums, for example CRC-based ones, which are stored with the object and checked on read. A checksum is a short fingerprint of the bytes; if even one bit changes, the fingerprint no longer matches, so corruption is caught instead of silently served.",
+    "deeper": "End to end is the important phrase. A checksum computed only on disk protects against disk corruption but not against a bad network card, a memory error in a server, or a software bug that garbles data between hops. By computing a checksum as early as possible, ideally at the client, and verifying it at each stage, the system can detect corruption wherever it occurs and refuse to store or serve bad bytes. Client-supplied checksums extend the protection all the way to the application: the client knows what it meant to upload, S3 stores that fingerprint with the object, and a later read can confirm that the bytes returned are exactly what was written. This complements the background auditing described earlier, which re-reads stored shards and verifies checksums to find silent rot. The ETag, often an MD5 for simple uploads, served a similar integrity role historically, but explicit additional checksums give clients a clearer, stronger contract. The chapter also warns that support for newer checksum features varies across S3-compatible systems.",
+    "quiz": {
+      "q": "Why compute checksums at the client instead of only on disk?",
+      "a": "Corruption can happen in networks, memory or software between hops. A client checksum verified at every stage catches it anywhere along the path."
+    }
+  },
+  {
+    "id": "ch03-028",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Durability reviews and coarse-grained guardrails",
+    "body": "S3's fourth durability ingredient is process and culture. Andy Warfield describes durability reviews: before a change ships, engineers write a threat model listing every way the change could lose data and how the design resists each one. The team also prefers coarse-grained guardrails, meaning simple mechanisms that block a whole class of risks, over patching each individual risk separately. The goal is to make data loss structurally hard, not just to fix bugs one by one.",
+    "deeper": "A durability review treats data loss the way a security review treats attacks. Instead of asking whether the change works, it asks how it could destroy data: a migration that deletes before copying, a garbage collector that misjudges which shards are referenced, a configuration push that points at the wrong fleet. Writing these threats down forces engineers to show a concrete defense for each. Coarse-grained guardrails reflect a lesson about scale: individually patching every discovered risk leaves you one unconsidered case away from an incident, while a broad mechanism can prevent a whole family of failures, including ones nobody imagined yet. The chapter does not list specific guardrails, but the general idea is familiar from elsewhere in the chapter, such as delaying deletion so a mistaken delete can be undone, or verifying writes before committing the index entry. Process counts as a durability ingredient because, as the next card stresses, most real data loss comes from software and people, and hardware redundancy does nothing against a system that faithfully executes a wrong instruction.",
+    "quiz": {
+      "q": "Why prefer coarse-grained guardrails over patching each risk separately?",
+      "a": "A simple mechanism blocks an entire class of failures, including ones nobody has thought of yet, while individual patches leave gaps."
+    }
+  },
+  {
+    "id": "ch03-029",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Most data loss is software and people, not three dead disks",
+    "body": "The senior staff lens on durability: most real data loss is not three disks failing at once. It is software and people, such as a bad deploy, a bug in garbage collection, or an operator deleting the wrong thing. Erasure coding schemes protect against hardware failure. Versioning, delayed deletion, formal checks on storage code and durability reviews protect against people and software. In any design review, ask about both kinds of protection, not just the coding scheme.",
+    "deeper": "This reframes the 11 nines discussion. The math of k and m parity shards and repair times produces impressive numbers, but those numbers assume failures are independent hardware events. A software bug is the opposite: it is perfectly correlated. A buggy garbage collector running on every storage node can delete the same class of data everywhere at once, and every shard of every affected object disappears together, no matter how much parity you have. An operator command that deletes a bucket is executed faithfully by a system designed never to lose data. Defenses against this category look different. Versioning keeps prior versions so overwrites and deletes can be reversed. Delayed deletion gives a window to notice a mistake before bytes are truly gone. Formal checks like ShardStore's reference model catch crash-consistency and concurrency bugs before they ship. Durability reviews force engineers to enumerate how a change could lose data. A design review that only asks about the erasure code has covered the less likely half of the risk.",
+    "quiz": {
+      "q": "Why can't erasure coding protect against a garbage-collection bug?",
+      "a": "A software bug is correlated: it can delete every shard of affected objects at once. Only software and process defenses like versioning and delayed deletion help."
+    }
+  },
+  {
+    "id": "ch03-030",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Heat: on hard drives, I/O per byte is the scarce resource",
+    "body": "A hard drive can do about 120 random I/O operations per second, and that number has barely changed since 2006, while capacity has grown enormously. Andy Warfield's key point: if drives get bigger but not faster, the I/O available per terabyte keeps falling. At today's sizes, spreading random I/O evenly gives roughly 1 I/O per second per 2 TB. So S3's scarce resource is not bytes, it is I/O per byte, which Warfield calls heat.",
+    "deeper": "The arithmetic is simple and relentless. A drive's random I/O is limited by mechanical movement, seeking the head and waiting for the platter to rotate, and those physical limits have not improved. Capacity, by contrast, keeps rising as more data is packed onto each platter. Divide a fixed I/O budget by a growing number of terabytes and each terabyte gets less I/O every year. This inverts the usual intuition about storage cost. You might think the main job is to store bytes cheaply, but bytes are the abundant resource; the ability to read them randomly is what runs out. A drive full of popular data could be overwhelmed while having plenty of free capacity. That is why the chapter's check-your-understanding asks why growing drive sizes make heat management harder each year: the same hot data now shares fewer I/Os, so placement must spread load more carefully. Meta hit the same wall: Haystack ran out of IOPS while capacity sat spare, a problem Tectonic later addressed by pooling resources. Google's Colossus responds by moving hot data to flash.",
+    "quiz": {
+      "q": "Why do bigger hard drives make heat management harder each year?",
+      "a": "Random I/O stays near 120 per second while capacity grows, so I/O per terabyte falls; the same hot data shares fewer I/Os and must be spread more carefully."
+    }
+  },
+  {
+    "id": "ch03-031",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Hot drives cause tail latency, so S3 spreads data wide",
+    "body": "If too many hot objects land on one drive, that drive becomes a hotspot, and its delays amplify up through the layers of the storage software stack as tail latency, the slow responses at the far end of the latency distribution. S3's first answer is very wide placement. New objects, and the objects within any single bucket, are spread across a very large number of drives. A single customer can then burst across a huge part of the fleet instead of saturating a few disks.",
+    "deeper": "Tail latency matters because a single request often depends on several shards or several internal calls. If an object is erasure coded into many shards and one shard lives on an overloaded drive, the whole read waits for the slowest piece, so one hot drive can slow requests that have nothing else in common. At S3's scale, some drive somewhere is always busy, which is why the problem cannot be solved by hoping it is rare. Wide placement attacks it by making it very unlikely that many hot objects share one drive. Because a bucket's objects are scattered widely, even a single customer with a sudden spike draws I/O from a vast pool of disks rather than from the handful that would hold the data under a naive layout. Warfield describes one customer workload that was served by over a million individual disks. That is a scale of parallelism no private cluster could offer, and it turns what would be a hotspot into a small increase in load spread thinly across the fleet.",
+    "quiz": {
+      "q": "Why can one overloaded drive slow down many unrelated S3 requests?",
+      "a": "Reads often need several shards; waiting on a slow drive delays the whole request, and delays amplify up the stack as tail latency."
+    }
+  },
+  {
+    "id": "ch03-032",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "The decorrelation effect: millions of bursts smooth out",
+    "body": "S3's second answer to heat is aggregation. Each workload on its own is bursty, with sharp peaks. But when millions of workloads share one fleet, their peaks do not line up, and in Warfield's words the aggregate demand smooths and becomes far more predictable. This decorrelation effect of scale is a real economic advantage of a huge shared service that a small private cluster cannot copy. The third answer is rebalancing: as data cools with age, S3 moves it so each drive holds a mix of hot and cold bytes.",
+    "deeper": "A private cluster must be sized for its own peak, even if that peak lasts minutes a day, so much of its I/O sits idle most of the time. In a shared fleet, one customer's peak coincides with other customers' quiet periods, so the fleet can be sized for the smoother aggregate curve rather than the sum of all peaks. That means better utilization and lower cost per unit of I/O. It is also why wide placement pays off: spreading every workload across many drives lets the fleet absorb bursts from its pooled headroom. Rebalancing addresses a slower drift. Newly written data tends to be hot and older data cold, as the photo example shows. If a drive filled up entirely with fresh data, it would be a hotspot; if it held only old data, its I/O would be wasted. Moving data over time so each drive has a blend of hot and cold bytes keeps I/O demand per drive roughly even. The chapter later notes that Dropbox's leave-the-cloud move gave up this decorrelation benefit.",
+    "quiz": {
+      "q": "Why can a huge shared fleet use disk I/O more efficiently than a private cluster?",
+      "a": "Independent workloads peak at different times, so aggregate demand is smooth; the fleet is sized for that, not for each workload's own peak."
+    }
+  },
+  {
+    "id": "ch03-033",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "How Google and Meta fight the same heat problem",
+    "body": "Google's Colossus tackles heat differently from S3. Newly written, hot data is spread across all drives and served from flash where that makes sense, and older, colder data moves to larger-capacity drives as it cools. A 2025 Google post describes L4, a distributed SSD cache that uses access-pattern analysis to decide what to place on flash. Meta's Tectonic paper describes the same tension between Haystack, limited by disk IOPS with spare capacity, and f4, limited by capacity with spare IOPS.",
+    "deeper": "All three companies face the same physics: hard drives have abundant capacity and scarce random I/O. S3's approach emphasizes wide placement, aggregation across tenants, and rebalancing so every drive holds a mix of hot and cold data. Colossus leans more on media tiering. Hot data gets flash, where random I/O is plentiful, and cold data drifts to the largest, cheapest drives, where low I/O per terabyte does not matter because nobody reads it. The L4 cache adds intelligence to that decision by analyzing access patterns rather than using age alone. Meta's story shows what happens when separate systems split the problem badly. Haystack stored hot photos and ran out of disk IOPS long before it filled its capacity. f4 stored warm data and filled its capacity while its IOPS sat idle. Each system stranded one resource. Tectonic's answer, covered later, was to merge them into one shared filesystem so hot and cold tenants could use the same drives' I/O and capacity together, echoing S3's goal of mixing hot and cold bytes on each drive.",
+    "quiz": {
+      "q": "What resource did Haystack and f4 each strand, and why?",
+      "a": "Haystack ran out of IOPS with spare capacity; f4 ran out of capacity with spare IOPS. Specialized systems could not share the unused resource."
+    }
+  },
+  {
+    "id": "ch03-034",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "3,500 writes and 5,500 reads per second, per prefix",
+    "body": "S3 automatically partitions its index by key range. AWS documents that an application can achieve at least 3,500 PUT, COPY, POST or DELETE requests and 5,500 GET or HEAD requests per second per partitioned prefix, with no limit on the number of prefixes. So ten prefixes give roughly ten times the read rate. Scaling is gradual, though: while S3 splits partitions to handle growing load, clients may see 503 Slow Down errors.",
+    "deeper": "A prefix here is the leading part of a key, and a partitioned prefix is a key range that S3 has assigned to its own index partition. Because the index is a sorted map split by ranges, requests for keys in one range all hit the same partition, which has a finite request rate. When traffic on a range grows, S3 splits it into more partitions, each with its own budget, but that split takes time, and during the transition some requests are throttled with 503 Slow Down. The practical rule for very high request rates is to spread keys across many prefixes on purpose, for example by putting a short hash early in the key, such as a7/photos/user-123/..., so that load naturally lands on many ranges. Equally important, clients must always retry 503 responses with exponential backoff and jitter, meaning wait times that grow after each failure and include randomness so many clients do not retry in lockstep. The key takeaways summarize: S3 scales per prefix, so spread hot keys and retry 503s.",
+    "quiz": {
+      "q": "Why does adding a short hash near the start of keys raise S3 throughput?",
+      "a": "The index is partitioned by key range, each with its own request limit. A hash spreads load across many ranges instead of one hot partition."
+    }
+  },
+  {
+    "id": "ch03-035",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Common mistake: date-first keys create one hot partition",
+    "body": "A classic error is putting a date as the first part of every key in a write-heavy log pipeline, like yyyy-mm-dd/ followed by the rest. Since S3 partitions its index by key range, all writes for a given day land in one narrow range, which becomes a single hot partition until S3 splits it. Throughput collapses into one partition's limit, and clients see 503 Slow Down errors. The fix is to put a hash or shard component early in the key.",
+    "deeper": "The chapter's check-your-understanding makes it concrete: a team puts yyyy-mm-dd/ at the start of every key in a bucket receiving 20,000 writes per second. The documented baseline is at least 3,500 writes per second per partitioned prefix, so one day's range is far over budget. All writes land in one narrow key range, one index partition. They will see 503 Slow Down until S3 splits the range, and may still exceed per-prefix limits. Worse, the problem recurs every day: at midnight a brand new, unsplit date range becomes the target. The remedy is to spread writes by adding a hash or shard number early in the key, for example a short hex hash before the date, and to retry 503s with exponential backoff. Queries by date still work if you keep an index or table format that records which keys belong to which day, rather than relying on listing by date prefix. The deeper principle is that key design is performance design in any range-partitioned store.",
+    "quiz": {
+      "q": "A bucket gets 20,000 writes/sec with yyyy-mm-dd/ key prefixes. What happens and what is the fix?",
+      "a": "All writes hit one hot partition, causing 503 Slow Down and exceeding per-prefix limits. Add a hash or shard early in the key and retry with backoff."
+    }
+  },
+  {
+    "id": "ch03-036",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Listing a billion objects takes a million calls",
+    "body": "S3's ListObjectsV2 returns keys in lexicographic order, meaning UTF-8 binary order, up to 1,000 per page, with a continuation token to fetch the next page. Listing a bucket with a billion objects therefore needs about a million mostly sequential calls. That is why big data systems avoid listing a directory to find files. Table formats like Apache Iceberg keep an explicit manifest of files instead, and S3 Inventory provides a daily or weekly file listing all objects for large audits.",
+    "deeper": "The continuation token is what makes listing sequential: each page tells you where the next begins, so a naive client must wait for page N before asking for page N+1. At 1,000 keys per page, the call count scales linearly with object count, and even fast calls add up to long runtimes and real request costs at a billion objects. This is a major reason analytics systems moved away from treating directories as the source of truth for which files belong to a table. Apache Iceberg and similar table formats keep a manifest, an explicit list of the data files that make up each snapshot, so a query engine reads a few metadata files instead of listing thousands of prefixes. S3 Inventory solves the other big use case, audits and bulk operations: rather than listing live, you get a periodic report file enumerating every object, which you can process offline. Note one exception: directory buckets in S3 Express One Zone have a real hierarchical namespace, and their list results are not returned in sorted order, so code that assumes sorted listing can break there.",
+    "quiz": {
+      "q": "Why do table formats like Iceberg keep a manifest instead of listing prefixes?",
+      "a": "Listing returns 1,000 keys per sequential page, so large buckets need huge numbers of calls. A manifest lists a table's files directly and cheaply."
+    }
+  },
+  {
+    "id": "ch03-037",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Storage classes: one API, many price and speed tiers",
+    "body": "S3 puts the same object API on top of different physical tiers called storage classes. They trade storage price against request price, minimum storage duration and retrieval time. S3 Standard serves hot data with millisecond access. S3 Intelligent-Tiering suits unknown or changing access. Cheaper classes charge less to store but more to read, or impose minimum durations. For the photo app, lifecycle rules could move photos older than 90 days to a cheaper class while keeping profile photos hot.",
+    "deeper": "The key insight is that the object model hides the tier: a GET looks the same whether the bytes sit on hot drives or in an archive, though latency and price differ dramatically. This lets applications optimize cost with lifecycle rules instead of code changes. The 90-day rule for photos reflects the same data-cools-with-age observation that drove Meta's f4 warm tier: most requests hit recent content, so older content can live somewhere cheaper. Profile photos are the exception, because they stay popular regardless of age; Meta's f4 study likewise found profile photos were never moved. Choosing a class requires knowing access patterns. Moving data that is still read often to an infrequent-access class can cost more, because retrieval and request charges outweigh storage savings. Minimum storage durations also matter: deleting or moving an object before the minimum still incurs the charge for the full period. Intelligent-Tiering exists for data whose pattern you cannot predict; it has no minimum duration, offers millisecond access, and has optional slower archive tiers. The next card lists the classes in detail.",
+    "quiz": {
+      "q": "Why keep profile photos hot while tiering other photos after 90 days?",
+      "a": "Most photos cool with age, but profile photos stay popular. Tiering them would add retrieval cost and latency without real savings."
+    }
+  },
+  {
+    "id": "ch03-038",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "S3 class cheat sheet: from Standard to Deep Archive",
+    "body": "S3 Standard, Intelligent-Tiering and Standard-IA use 3 or more Availability Zones with millisecond access; Standard-IA has a 30-day minimum and suits backups read monthly. S3 One Zone-IA uses one zone, 30-day minimum, for re-creatable copies. S3 Express One Zone uses one zone with single-digit millisecond latency for ML training and analytics scratch. Glacier Instant Retrieval gives millisecond access with a 90-day minimum. Glacier Flexible Retrieval takes minutes to hours, 90 days. Glacier Deep Archive takes within 12 hours, 180 days, for compliance archives.",
+    "deeper": "Reading the table as a set of trade-offs helps more than memorizing it. Zone count is a durability and availability decision: One Zone-IA and Express One Zone store data in a single Availability Zone, so they suit data you can re-create or that needs locality more than resilience. Every other listed class spans 3 or more zones. Minimum storage duration signals the intended use: none for Standard and Intelligent-Tiering, 30 days for the IA classes, 90 days for Glacier Instant and Flexible Retrieval, and 180 days for Deep Archive. Delete early and you still pay for the minimum. First-byte latency separates classes that are cheaper but still online, such as Standard-IA and Glacier Instant Retrieval, both in milliseconds, from true archives. Glacier Flexible Retrieval takes minutes to hours, and Deep Archive within 12 hours, so they fit only data you can wait for, such as compliance archives. Typical uses in the table: hot data for Standard, unknown or changing access for Intelligent-Tiering, archives read rarely but fast for Glacier Instant Retrieval, and archives for Glacier Flexible Retrieval.",
+    "quiz": {
+      "q": "When is S3 One Zone-IA a reasonable choice, and what is the risk?",
+      "a": "For re-creatable copies read infrequently. It stores data in a single AZ, so an AZ failure can make it unavailable or lost."
+    }
+  },
+  {
+    "id": "ch03-039",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "S3 Express One Zone: 10x faster, one AZ, directory buckets",
+    "body": "Launched November 28, 2023, S3 Express One Zone stores data in a single Availability Zone on purpose-built hardware, in a new bucket type called a directory bucket. AWS claims up to 10x faster data access than S3 Standard, consistent single-digit millisecond latency, and request costs up to 80% lower. It targets ML training data loaders, interactive analytics and other workloads that make many small requests, where latency and request cost dominate over storage price.",
+    "deeper": "Several design choices make it fast. Single AZ: you place compute in the same zone to cut network latency, but an AZ failure can make data unavailable or, in a disaster, lost. Session-based authentication: a CreateSession call returns a short-lived token, valid for five minutes, so each request does not pay the full IAM authorization cost. Hierarchical namespace: directory buckets have real directories, unlike the flat namespace of general purpose buckets, and listing results are not sorted. Those differences mean code written for S3 Standard may need changes, particularly anything that assumes sorted listings. The chapter's quiz answer frames the decision: choose Express One Zone when latency or request cost dominates, for example ML data loading or many small reads from compute in one AZ. You give up multi-AZ resilience, and some API behaviors differ: directory buckets, unsorted listing and session auth. It is one of three recent S3 products, alongside Tables and Vectors, that extend object storage into workloads which used to need a separate system in front of S3.",
+    "quiz": {
+      "q": "When would you choose S3 Express One Zone over S3 Standard, and what do you give up?",
+      "a": "When latency or request cost dominates, like ML data loading from same-AZ compute. You lose multi-AZ resilience and get different API behavior like unsorted listing."
+    }
+  },
+  {
+    "id": "ch03-040",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "S3 Tables: Iceberg becomes a native storage primitive",
+    "body": "Launched December 3, 2024, S3 Tables added a third bucket type, the table bucket, which stores Apache Iceberg tables. S3 runs table maintenance for you: compacting small files to a target size configurable between 64 and 512 MiB, expiring old snapshots, and removing unreferenced files. AWS claims up to 3x faster queries and up to 10x more transactions per second than self-managed Iceberg tables in general purpose buckets. The deeper idea: object storage is moving up from bytes by key to tables.",
+    "deeper": "Apache Iceberg is a table format that stores data as files in object storage plus metadata that tracks which files belong to each snapshot of the table. Running it yourself means operating background jobs. Small files accumulate from frequent writes and slow queries down, so they must be compacted into larger ones. Old snapshots pile up and must be expired. Files no longer referenced by any snapshot must be deleted to stop paying for them. Getting any of this wrong either hurts performance or wastes storage, and some mistakes can break the table. S3 Tables moves that maintenance into the storage service. It also builds on earlier S3 features: conditional writes, added in 2024, let table formats implement atomic commit steps directly on S3 instead of an external lock service. The strategic significance is captured in the chapter's phrase: object storage is moving up the stack. A table becomes something the storage layer understands natively, rather than a convention that each analytics engine maintains on top of anonymous objects.",
+    "quiz": {
+      "q": "What maintenance work does S3 Tables take off a team running Iceberg?",
+      "a": "Compacting small files, expiring old snapshots and removing unreferenced files, which otherwise need self-managed background jobs."
+    }
+  },
+  {
+    "id": "ch03-041",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "S3 Vectors: cheap embeddings search for rarely queried data",
+    "body": "S3 Vectors previewed in mid-2025 and became generally available on December 2, 2025. It adds vector buckets and vector indexes for storing and searching embeddings. At launch, AWS listed up to 2 billion vectors per index, up to 20 trillion vectors per vector bucket, query latency around 100 ms or less for frequent queries and under a second for infrequent ones, and claimed cost cuts of up to 90% versus specialized vector databases.",
+    "deeper": "Embeddings are numeric vectors that represent content such as text, images or audio, and similarity search finds the vectors closest to a query. Specialized vector databases are built for very low-latency online retrieval, which usually means keeping indexes in memory or on fast storage, and that is expensive at large scale. S3 Vectors takes the object storage trade-off instead: much lower cost per vector, with latency measured in around 100 ms for frequent queries and under a second for infrequent ones. It is aimed at large, rarely queried vector sets, such as retrieval-augmented generation archives or semantic search over media libraries, not at the lowest-latency online retrieval path. The design fits the chapter's recurring theme of data that is large and mostly cold. Just as most photos are rarely read after their first days, many embedding collections are queried only occasionally, and paying in-memory prices for all of them wastes money. S3 Vectors, Tables and Express One Zone together show object storage absorbing workloads that once required a separate system.",
+    "quiz": {
+      "q": "What kind of vector workload fits S3 Vectors, and which does not?",
+      "a": "Large, rarely queried sets like RAG archives or media search fit. Lowest-latency online retrieval still suits specialized vector databases."
+    }
+  },
+  {
+    "id": "ch03-042",
+    "chapter": 3,
+    "section": "3.2 Amazon S3 in depth",
+    "title": "Will object storage absorb your specialized store?",
+    "body": "Notice the pattern in S3's recent launches: Express One Zone for lower latency, Tables for structured data, and Vectors for similarity search. Each one attacks a workload that used to need a separate system in front of S3. The senior staff lens: when you choose a specialized store, ask whether object storage will absorb this use case within two years, and what your team will own if it does not. That question guards against both premature bets and lock-in to niche systems.",
+    "deeper": "The question has two halves, and both matter. The first recognizes a trend: object storage keeps moving up the stack, from bytes by key to low-latency buckets, native Iceberg tables and vector indexes. A team that builds and operates its own specialized cluster today might find, soon after, that the cloud storage layer offers a cheaper managed version, leaving them with a system to maintain and migrate away from. The second half keeps the decision honest. If object storage does not absorb the use case, what exactly will your team own: operating the cluster, handling upgrades, capacity planning, durability, on-call? Specialized systems are sometimes the right choice, for example when you need the lowest online latency that S3 Vectors does not target. But the ownership cost should be explicit, not discovered later. This fits a wider pattern in the chapter. Meta consolidated specialized systems into Tectonic to stop stranding resources, and Dropbox's leave-the-cloud decision worked only because its workload was simple, huge and predictable.",
+    "quiz": {
+      "q": "Why ask whether object storage will absorb a use case before adopting a specialized store?",
+      "a": "S3 keeps adding features like Tables and Vectors. A custom system may soon be redundant, yet your team still owns operating and migrating it."
+    }
+  },
+  {
+    "id": "ch03-043",
+    "chapter": 3,
+    "section": "3.3 Google Cloud Storage and Azure Blob Storage",
+    "title": "Colossus: the filesystem under Google Cloud Storage",
+    "body": "Google Cloud Storage runs on Colossus, Google's cluster filesystem and the successor to GFS. Google's 2021 description lists four parts. The client library is the most complex, implementing software RAID and encodings chosen per application. Curators are the scalable metadata service. D file servers are network-attached disks, with data flowing directly between clients and D servers. Custodians are background workers that keep data durable and balanced, including RAID reconstruction.",
+    "deeper": "Putting complexity in the client library is an unusual choice. Instead of the servers deciding how data is encoded and replicated, the client does software RAID and picks encodings per application, so different users of Colossus can get different durability and performance trade-offs from the same fleet. Data does not pass through the metadata service: clients talk to curators to learn where data lives, then read and write directly with D file servers. That keeps the metadata path small and the data path wide. The biggest scaling improvement over GFS came from metadata. Colossus stores filesystem metadata in Bigtable, Google's distributed table store, which let it scale more than 100x beyond the largest GFS clusters. GFS had famously used a single master for metadata, which limited cluster size. Custodians play the same role as S3's background repair and rebalance services, rebuilding lost data and spreading load. Google's 2025 update says it runs at least two Colossus filesystems larger than 10 exabytes each, with over 50 TB/s of read and 25 TB/s of write throughput across its fleet.",
+    "quiz": {
+      "q": "How did Colossus scale far beyond GFS clusters?",
+      "a": "It moved filesystem metadata into Bigtable via scalable curators, letting it grow more than 100x beyond the largest GFS clusters."
+    }
+  },
+  {
+    "id": "ch03-044",
+    "chapter": 3,
+    "section": "3.3 Google Cloud Storage and Azure Blob Storage",
+    "title": "GCS keeps its namespace in Spanner, on shared Google infra",
+    "body": "In Google's description of the Cloud Storage stack, Spanner, Google's globally consistent database, holds metadata about access permissions and data location. That fits GCS's strong global consistency for object and list operations: a globally consistent database is a natural home for the object namespace. The key architectural difference from S3 is that GCS is one product built on shared Google infrastructure, Colossus for bytes and Spanner for metadata, which YouTube, Ads and Compute Engine also use.",
+    "deeper": "The contrast with S3 is instructive. S3 is a standalone service with its own purpose-built layers: ShardStore on storage nodes, its own sharded index, and in 2020 a witness-based cache coherence protocol to reach strong consistency. GCS inherits capabilities from general Google systems instead. Strong consistency for reads after writes, deletes and listing comes naturally when the namespace sits in Spanner, which is designed to be globally consistent. Durable byte storage comes from Colossus, which Google already operates at exabyte scale for many internal products. The trade-off is familiar from any platform decision. Shared infrastructure means GCS benefits from investment and scale driven by the whole company, and its behavior aligns with other Google systems. A purpose-built stack lets S3 optimize every layer for object storage specifically, such as heat-aware placement across millions of drives, at the cost of building and verifying more itself. Remember the caveat from earlier: even GCS's strong consistency has scope limits, since public caches and IAM permission changes remain eventually consistent.",
+    "quiz": {
+      "q": "Why does storing the namespace in Spanner suit GCS's consistency model?",
+      "a": "Spanner is a globally consistent database, so keeping object metadata there naturally gives strong consistency for reads, deletes and listings."
+    }
+  },
+  {
+    "id": "ch03-045",
+    "chapter": 3,
+    "section": "3.3 Google Cloud Storage and Azure Blob Storage",
+    "title": "Azure storage stamps: racks of 2 PB to 30 PB, kept at 70%",
+    "body": "Microsoft published the architecture of Windows Azure Storage, or WAS, at SOSP 2011, and it remains the clearest public design of a cloud object store. Its basic unit is the storage stamp, a cluster of racks. First-generation stamps held about 2 PB raw; the next generation held up to 30 PB. Microsoft aims to keep each stamp around 70% utilized and moves accounts between stamps as one fills up. A Location Service maps each storage account to a stamp.",
+    "deeper": "The stamp is a unit of scale and failure. Instead of one giant global cluster, Azure builds many bounded clusters, each with its own full stack of front ends, partition servers and storage. That caps the blast radius of problems and makes capacity planning concrete: add stamps to grow. Keeping stamps near 70% utilization leaves headroom for bursts, drive failures and rebuilds, and for accepting accounts migrated from fuller stamps. The Location Service is what makes stamps invisible to customers. It maps each storage account to a stamp and updates DNS so that a name like account.blob.core.windows.net resolves to the right stamp. Moving an account between stamps therefore changes a DNS entry rather than every client's configuration. This contrasts with S3's approach of spreading each bucket's objects over a very large number of drives across the fleet. Azure's stamps bound an account to one cluster, while replication to another stamp provides geo disaster recovery. The next card covers what runs inside a stamp: the front-end, partition and stream layers.",
+    "quiz": {
+      "q": "How can Azure move a storage account between stamps without client changes?",
+      "a": "The Location Service maps accounts to stamps and updates DNS, so the account's hostname simply points to the new stamp."
+    }
+  },
+  {
+    "id": "ch03-046",
+    "chapter": 3,
+    "section": "3.3 Google Cloud Storage and Azure Blob Storage",
+    "title": "Inside an Azure stamp: front end, partitions, streams",
+    "body": "Each Azure stamp has three layers. Stateless front-end servers authenticate requests and route them to the right partition server. The partition layer manages blobs, tables and queues in range partitions, each served by one partition server; this is where strong consistency and per-partition transactions come from. The stream layer is an append-only distributed filesystem storing data in extents. An extent grows until it reaches a target size, is then sealed, and a sealed extent is immutable.",
+    "deeper": "The layering mirrors S3's split of front end, index and storage. The front end is stateless and scales with requests. The partition layer is the metadata and consistency brain: because each range partition is served by a single partition server at a time, that server can order operations on its keys and offer strong consistency and transactions within the partition without distributed locking. The stream layer handles durability and bytes, knowing nothing about blobs or tables, just append-only streams of extents. Sealing is the key trick. While an extent is open for appends it is replicated synchronously within the stamp for durability. Once sealed, it can never change, which means the stream layer can later erasure code cold sealed extents to save space, exactly the immutability benefit described at the start of the chapter: parity is computed once and never updated. The chapter's in-industry note calls out that this seal-then-erasure-code approach is the same idea as Meta's hot in Haystack, then move to f4. Replication details are covered on the next card.",
+    "quiz": {
+      "q": "Why can Azure erasure code an extent only after it is sealed?",
+      "a": "A sealed extent is immutable, so parity is computed once and never recalculated. Open extents are still being appended to."
+    }
+  },
+  {
+    "id": "ch03-047",
+    "chapter": 3,
+    "section": "3.3 Google Cloud Storage and Azure Blob Storage",
+    "title": "Azure replication: sync inside a stamp, async across regions",
+    "body": "Windows Azure Storage uses two kinds of replication with different jobs. Intra-stamp replication, inside the stream layer, is synchronous: a write is copied to replicas within the stamp before it is acknowledged, which provides durability. Inter-stamp replication copies data to another stamp, typically in another region, asynchronously, which provides geographic disaster recovery. Splitting replication this way keeps write latency low while still protecting against the loss of an entire site.",
+    "deeper": "Synchronous replication across regions would force every write to wait for a round trip over long distances, adding significant latency to every request. By keeping synchronous replication within a stamp, where replicas are close, Azure acknowledges writes quickly while still guaranteeing that an acknowledged write survives individual failures inside the cluster. Asynchronous replication to another stamp in another region handles the rarer, larger disaster: losing a whole stamp or site. The trade-off is that asynchronous copies lag slightly behind, so a sudden regional disaster could lose the most recent writes that had not yet been shipped. Within the stamp, the stream layer can also later erasure code cold sealed extents, reducing the storage overhead of synchronous replicas for data that is no longer changing. The chapter's comparison table summarizes Azure's data protection as synchronous replicas in the stamp, erasure coding of sealed extents, and asynchronous geo replication. Compare with Dropbox Magic Pocket, which stores each block in at least two geographic zones with cross-zone replication within about one second of upload.",
+    "quiz": {
+      "q": "Why is Azure's inter-stamp replication asynchronous rather than synchronous?",
+      "a": "Synchronous cross-region copies would add long round trips to every write. Async geo replication keeps writes fast while still enabling disaster recovery."
+    }
+  },
+  {
+    "id": "ch03-048",
+    "chapter": 3,
+    "section": "3.3 Google Cloud Storage and Azure Blob Storage",
+    "title": "The universal pattern: metadata layer over immutable data",
+    "body": "Look across S3, Windows Azure Storage and Colossus and the same pattern appears: a separate metadata or index layer sits over an append-only or immutable data layer, with erasure coding applied once data is sealed. The Azure paper's seal then erasure code is the same idea as Meta's hot in Haystack, then move to f4. Different companies, working independently, converged on this architecture because it separates the hard coordination problem from the bulk byte-storage problem.",
+    "deeper": "Why does this split keep winning? Metadata operations need consistency, ordering and fast lookups, but they involve small records. Data operations involve huge volumes of bytes but, if the data is immutable, need almost no coordination. Separating the two lets each layer use the right tools: a sharded index, Bigtable, Spanner, a partition layer or ZippyDB for metadata, and simple append-only storage for bytes. Immutable data also makes durability cheaper over time. New data is often kept in a form that is fast to write and read, such as replicas, while it is hot and still being assembled. Once sealed, it can be converted to an erasure-coded form with much lower overhead, because parity is computed once and never updated. The same arc shows up at S3, Azure with sealed extents, Meta moving from Haystack's 3.6x replication to f4's 2.1x, and Dropbox's replicate-first, erasure-code-later design. And every one commits a write by recording it in the metadata layer last, after the data is durable.",
+    "quiz": {
+      "q": "Why do large object stores erasure code data only after it is sealed?",
+      "a": "Sealed data is immutable, so parity is computed once. Hot, still-changing data stays replicated where writes are simpler and faster."
+    }
+  },
+  {
+    "id": "ch03-049",
+    "chapter": 3,
+    "section": "3.4 Meta: Haystack, f4 and Tectonic",
+    "title": "Facebook 2010: 260 billion photos drowning in metadata I/O",
+    "body": "In 2010, Facebook stored over 260 billion images, more than 20 PB, took in about one billion new photos, roughly 60 TB, per week, and served over one million images per second at peak. Each upload was stored in four sizes. The first design used NAS appliances over NFS, with one file per image. The bottleneck was metadata I/O: reading one photo took several disk operations just to find it, so disk seeks, not bandwidth, limited performance.",
+    "deeper": "Reading one photo on the NFS design meant one or more disk operations to translate the filename to an inode, one to read the inode, and one to read the data itself. With a naive directory layout, a single read could take more than 10 disk operations. Since each hard drive offers only on the order of 120 random operations per second, spending most of them on filesystem bookkeeping rather than photo bytes wasted the scarcest resource. The problem compounds with the four stored sizes per upload, because each size is another file with its own inode and directory entry. Caching metadata in memory helps only if it fits, and with hundreds of billions of files, general-purpose filesystem metadata was far too large to keep fully in RAM. Meta's photo story, from this starting point to Haystack, then f4, then Tectonic, is the best public example of one company evolving object storage over a decade. Its first step, Haystack, was published at OSDI 2010 and attacked exactly this metadata overhead.",
+    "quiz": {
+      "q": "Why did Facebook's NFS photo store waste disk capacity for I/O?",
+      "a": "Each read needed several disk operations for directory lookup, inode and data. Seeks for metadata, not bandwidth, used up each drive's limited I/O."
+    }
+  },
+  {
+    "id": "ch03-050",
+    "chapter": 3,
+    "section": "3.4 Meta: Haystack, f4 and Tectonic",
+    "title": "Haystack: photos as needles, one disk read per photo",
+    "body": "Haystack, published at OSDI 2010, packed many photos into a few very large files called physical volumes, about 100 GB each. Each photo is a needle inside a volume, consisting of a header, a key, flags, size, the data and a checksum. Each Store machine keeps an in-memory index from photo key to volume, offset and size. So a read needs at most one disk operation: seek to the offset and read. The filesystem metadata overhead disappears.",
+    "deeper": "The design works because the in-memory index is tiny compared with general filesystem metadata: just a key and a few numbers per photo, rather than inodes, directory entries and permissions. That made it feasible to hold the whole map in RAM, removing every metadata disk operation from the read path. Writes are appends to the end of a volume, which suits hard drives well. An update is just a new needle with the same key; the newest one wins. Deletes set a flag in the needle, and compaction later rewrites volumes to reclaim space from deleted and overwritten needles. For fast recovery, each volume has an index file so a machine can rebuild its in-memory map quickly after a restart, rather than scanning 100 GB volumes. Above the Store machines, a Directory maps logical volumes to physical volumes on different machines, which provides replication, and a Cache absorbs hot reads. The paper reports each usable terabyte cost about 28% less and served about 4x more reads per second than the NAS setup.",
+    "quiz": {
+      "q": "What did Haystack change to cut disk operations per photo read?",
+      "a": "It packed photos into large volume files and kept an in-memory key-to-offset index, so a read takes at most one disk operation instead of several."
+    }
+  },
+  {
+    "id": "ch03-051",
+    "chapter": 3,
+    "section": "3.4 Meta: Haystack, f4 and Tectonic",
+    "title": "f4's insight: request rates collapse as photos age",
+    "body": "Haystack kept three replicas, and each Store machine used RAID-6, giving an effective replication factor of 3.6, or 3 x 1.2. That was fine for hot data but too expensive for data nobody reads. Meta measured that BLOB request rates fall sharply with age: week-old BLOBs had an order of magnitude lower request rate than content less than a day old, for eight of nine types studied. Photos became warm after about three months, and profile photos were never moved.",
+    "deeper": "This measurement is the real innovation of f4, published at OSDI 2014. A BLOB is a binary large object, such as a photo or video. If requests drop by an order of magnitude within a week, then the vast majority of stored bytes are rarely read, yet under Haystack they paid for 3.6x raw storage and the I/O capacity designed for hot traffic. The measurement justified a separate warm tier: once content cools, it can move to a system optimized for low cost per byte rather than high I/O per byte. The rule was not uniform. Photos were considered warm after about three months, while profile photos, which stay popular because they appear everywhere a user does, were never moved. The chapter's senior staff lens stresses the point: f4 did not win by a clever code, it won by measuring access by age and building a cheaper tier for the long tail. Before designing any storage tier, get the request-rate-by-object-age curve for your own data. S3 lifecycle rules apply the same insight.",
+    "quiz": {
+      "q": "Where does Haystack's 3.6x effective replication factor come from?",
+      "a": "Three replicas, each on a Store machine using RAID-6 with 1.2x overhead: 3 x 1.2 = 3.6x raw storage per logical byte."
+    }
+  },
+  {
+    "id": "ch03-052",
+    "chapter": 3,
+    "section": "3.4 Meta: Haystack, f4 and Tectonic",
+    "title": "f4 in a cell: Reed-Solomon 10+4 across racks",
+    "body": "f4 stores warm BLOBs more cheaply than Haystack. Inside a cell, data is encoded with Reed-Solomon (10,4): 10 data blocks plus 4 parity blocks, so any 10 of the 14 can rebuild the data. That is a storage overhead of 1.4x, compared with 3.6x for Haystack. The blocks of each stripe are spread across racks, so losing a whole rack removes at most a small number of blocks from any stripe. In 2014, f4 stored over 65 PB of logical data.",
+    "deeper": "Erasure coding suits warm data particularly well. Reads are rare, so the extra work of reconstruction when a block is missing matters little, while the capacity savings apply to every stored byte. And because f4 holds data that has already cooled, it is effectively immutable: no small in-place updates force parity recomputation. Spreading a stripe's blocks across racks applies the same placement logic S3 uses across drives, hosts and Availability Zones. A rack can fail as a unit, due to a switch or power problem, and if several blocks of one stripe sat in that rack, a single failure could take out more than the four the code tolerates. Rack-aware placement keeps failures close to independent. The 1.4x overhead applies within one cell, in one region. Protecting against the loss of an entire region needs another layer. Keeping a second full encoded copy in another region would double overhead to 2.8x; f4 instead used a cheaper XOR scheme across regions, described on the next card, which brought the effective factor to 2.1x.",
+    "quiz": {
+      "q": "Why is erasure coding a good fit for warm data specifically?",
+      "a": "Warm data is rarely read and effectively immutable, so reconstruction cost is rarely paid and parity never needs updating, while capacity savings apply to every byte."
+    }
+  },
+  {
+    "id": "ch03-053",
+    "chapter": 3,
+    "section": "3.4 Meta: Haystack, f4 and Tectonic",
+    "title": "f4's XOR trick: survive a region loss at 2.1x, not 2.8x",
+    "body": "To survive losing a whole region, f4 did not store a full second copy. Instead it paired two volumes in two different regions, and stored their XOR in a third region. If any one region is lost, its volume can be rebuilt from its buddy volume and the XOR. Two full encoded copies would cost 1.4 x 2 = 2.8x. With XOR geo-replication, it is (1.4 x 2 + 1.4) / 2 = 2.1x per logical byte.",
+    "deeper": "XOR is the simplest possible parity: A XOR B stored separately means that if A is lost, A equals B XOR (A XOR B), and vice versa. Applied to whole volumes across regions, it acts as a geographically distributed erasure code with two data pieces and one parity piece. The accounting works out as follows. Volume A in region A is stored at 1.4x because of Reed-Solomon (10,4) within its cell. Buddy volume B in region B is also 1.4x. The XOR volume in region C is the same size as one volume and also encoded at 1.4x. Total raw storage is 1.4 + 1.4 + 1.4 = 4.2 for two logical volumes, which is 2.1x per logical byte. Compare 2.8x for keeping two full encoded copies and 3.6x for Haystack. The trade-off is recovery cost: rebuilding after a region loss requires reading both the buddy and the XOR from other regions, which is heavy on cross-region bandwidth. For warm, rarely read data, that rare expense is worth the large permanent savings.",
+    "quiz": {
+      "q": "Explain Meta's effective replication factors of 3.6x, 2.8x and 2.1x.",
+      "a": "Haystack: 3 replicas x RAID-6 1.2 = 3.6x. f4 RS(10,4) is 1.4x; two regional copies give 2.8x. XOR geo-replication: (1.4+1.4+1.4)/2 = 2.1x."
+    }
+  },
+  {
+    "id": "ch03-054",
+    "chapter": 3,
+    "section": "3.4 Meta: Haystack, f4 and Tectonic",
+    "title": "Measure access by age: f4 saved about 97 PB of disk",
+    "body": "A back-of-envelope estimate: at 65 PB of logical data, moving from Haystack's 3.6x to f4's 2.1x saves 65 x 1.5, about 97 PB of raw disk. That is the kind of number that pays for a whole storage team. The senior staff lens: f4 did not win with a clever code. It won by measuring access by age and building a cheaper tier for the long tail. Before designing a storage tier, get the request rate by object age curve for your data.",
+    "deeper": "The lesson is about where engineering leverage comes from. Reed-Solomon codes and XOR parity were well known long before f4. What made the project valuable was the measurement that most BLOBs cool dramatically within days or weeks, combined with the decision to act on it with a separate system tuned for cold bytes. The saving scales with data size, so at Meta's scale the difference of 1.5x per logical byte turned into tens of petabytes of disks, plus the servers, power, space and operations to run them. For your own systems, the request-rate-by-age curve tells you whether a tier is worth building and where the threshold belongs. If requests fall steeply after a week, tiering can save a great deal; if access is flat or unpredictable, a warm tier may cost more in retrieval and complexity than it saves. The same curve informs S3 lifecycle rules, such as moving photos older than 90 days to a cheaper class while keeping profile photos hot, the same exception Meta made.",
+    "quiz": {
+      "q": "What was the real reason f4 succeeded, according to the chapter?",
+      "a": "Measuring how request rates fall with object age and building a cheaper tier for the rarely read long tail, not a novel coding scheme."
+    }
+  },
+  {
+    "id": "ch03-055",
+    "chapter": 3,
+    "section": "3.4 Meta: Haystack, f4 and Tectonic",
+    "title": "Tectonic: one exabyte filesystem to stop stranding resources",
+    "body": "By 2021, Meta had replaced Haystack, f4 and its data-warehouse HDFS clusters with Tectonic, an exabyte-scale multitenant filesystem described at FAST 2021. The reason: specialized systems strand resources. Haystack ran out of IOPS while capacity sat spare, and f4 ran out of capacity while IOPS sat spare. One shared system can use both. Tectonic scales a single cluster to exabytes, one per datacenter, serving about ten tenants such as blob storage and the data warehouse.",
+    "deeper": "Stranding is an efficiency problem that specialization creates. Each specialized system is sized for its own bottleneck, so its other resource is left over and cannot be lent to anyone else. Hot photo storage needs I/O and has room to spare; warm storage needs capacity and has idle I/O. Put both tenants on the same drives and the hot tenant uses the I/O while the cold tenant uses the capacity, mixing hot and cold bytes per drive, which is the same goal S3 pursues with rebalancing. Tectonic's metadata design makes that scale possible. It splits metadata into independently scalable layers, Name, File and Block, stored in ZippyDB, and uses hash partitioning to avoid metadata hotspots, avoiding the key-range hotspot problem that S3 users must manage with key design. Each tenant can choose its own encoding, for example RS(9,6) for long-lived data, so consolidation does not force one durability trade-off on everyone. Moving the data warehouse from HDFS to Tectonic cut the number of warehouse clusters by 10x.",
+    "quiz": {
+      "q": "Why did consolidating Haystack and f4 into Tectonic improve efficiency?",
+      "a": "Each stranded one resource: Haystack spare capacity, f4 spare IOPS. A shared system lets hot tenants use I/O and cold tenants use capacity on the same drives."
+    }
+  },
+  {
+    "id": "ch03-056",
+    "chapter": 3,
+    "section": "3.4 Meta: Haystack, f4 and Tectonic",
+    "title": "Haystack to f4 to Tectonic: specialize, specialize, merge",
+    "body": "Meta's decade of photo storage follows a clear arc. Haystack specialized for performance, cutting disk operations per read to at most one. f4 specialized again for cost, moving cooled data to an erasure-coded warm tier at 2.1x instead of 3.6x. Tectonic then consolidated everything, including the data warehouse, into one multitenant filesystem for efficiency and simpler operations. Each step solved the previous design's main weakness: first I/O, then storage cost, then stranded resources.",
+    "deeper": "The arc is a useful template for thinking about any storage platform's lifecycle. Early on, one workload dominates and a specialized system tuned for its bottleneck wins big, as Haystack did with 4x more reads per second than NAS. As data accumulates and cools, cost becomes the dominant problem, and a second specialized tier pays off, as f4 did with roughly 97 PB of raw disk saved. But multiple specialized systems each strand resources and each need their own operations team, tooling and capacity planning. Eventually the overhead of running several systems outweighs the gains of specialization, and a general, multitenant system with per-tenant choices becomes the better design. Tectonic kept the benefits of specialization through per-tenant encoding choices, such as RS(9,6) for long-lived data, while pooling I/O and capacity. The chapter's key takeaways summarize the three strategies: optimize for I/O, then for cost using age-based tiers, then consolidate to stop stranding resources. The comparison is also a caution against assuming the current design is final.",
+    "quiz": {
+      "q": "What problem did each step of Meta's Haystack, f4, Tectonic arc solve?",
+      "a": "Haystack cut read I/O, f4 cut storage cost for cooled data with erasure coding, and Tectonic consolidated systems to stop stranding IOPS and capacity."
+    }
+  },
+  {
+    "id": "ch03-057",
+    "chapter": 3,
+    "section": "3.5 Dropbox Magic Pocket and Backblaze Vaults",
+    "title": "Dropbox left S3: 500 PB moved to Magic Pocket by 2015",
+    "body": "Dropbox originally stored its users' file blocks on Amazon S3. The Magic Pocket project began in 2013, and by October 2015 Dropbox served over 90% of user data from its own infrastructure, after moving over 500 PB. Dropbox gave two reasons: end-to-end control over performance, and better unit economics at its scale. It is the classic example of a company leaving the public cloud for its core storage.",
+    "deeper": "Moving 500 PB is a multi-year engineering effort, not a configuration change, and it only makes sense when the benefits are large and durable. Control over performance means Dropbox could tune the whole path, hardware, network and software, for its own workload rather than for the average S3 customer. Unit economics means that at hundreds of petabytes, the margin a cloud provider charges on each byte becomes large enough to fund building and running your own storage, including the team. The chapter's in-industry note explains why it worked for Dropbox specifically: the workload is simple, since blocks are immutable; huge, at hundreds of petabytes; and predictable, growing steadily rather than spiking. It warns that the same decision would be poor for a company with small or spiky storage needs. Such a company would lose the decorrelation benefit of S3, where millions of workloads with unaligned peaks share one fleet, and would also have to staff a storage team to handle durability, repair and hardware lifecycle that S3 otherwise provides.",
+    "quiz": {
+      "q": "Why would leaving S3 be a poor choice for a company with small, spiky storage needs?",
+      "a": "It loses S3's decorrelation benefit of sharing a smoothed fleet, and must staff a storage team, without the scale that made Dropbox's economics work."
+    }
+  },
+  {
+    "id": "ch03-058",
+    "chapter": 3,
+    "section": "3.5 Dropbox Magic Pocket and Backblaze Vaults",
+    "title": "Inside Magic Pocket: 4 MB blocks, 1 GB buckets, 50 PB cells",
+    "body": "Dropbox's 2016 description of Magic Pocket: files are cut into blocks of up to 4 MB. Blocks are grouped into 1 GB buckets, which are stored in volumes that are replicated or erasure coded across storage machines. A cell holds about 50 PB raw. Each block is stored in at least two geographic zones, with cross-zone replication within about one second of upload. New data is replicated first, then erasure coded later for efficiency.",
+    "deeper": "The block-and-bucket hierarchy is another instance of packing small things into big immutable containers, like Haystack's needles in 100 GB volumes. Tracking billions of 4 MB blocks individually on disk would multiply metadata; grouping them into 1 GB buckets lets storage machines deal with a manageable number of large units. Replicating new data first and erasure coding it later matches the seal-then-encode pattern seen at Azure and in Meta's Haystack-to-f4 path: fresh data is replicated for simple, fast writes and reads, then converted to a cheaper encoding once it settles. Storing each block in at least two geographic zones, replicated within about one second, protects against losing a site while keeping the window of single-zone exposure short. One distinctive choice is coordination. Each cell has a simple central Master rather than a Paxos-based coordinator, the consensus approach many distributed systems use for fault-tolerant coordination. Dropbox chose simplicity wherever it could, accepting a simpler central component over the complexity of consensus. The comparison table lists Magic Pocket's metadata as a per-cell Master plus a block index.",
+    "quiz": {
+      "q": "Why does Magic Pocket replicate new data first and erasure code it later?",
+      "a": "Replication gives simple, fast handling of fresh data; once data settles, erasure coding reduces storage overhead, the same seal-then-encode pattern as Azure and f4."
+    }
+  },
+  {
+    "id": "ch03-059",
+    "chapter": 3,
+    "section": "3.5 Dropbox Magic Pocket and Backblaze Vaults",
+    "title": "SMR drives: terrible for filesystems, perfect for Dropbox",
+    "body": "In 2018, Dropbox deployed SMR, or shingled magnetic recording, drives at petabyte scale. SMR drives overlap their tracks like roof shingles, which packs in more data but means you cannot rewrite a small region in place without disturbing neighboring tracks. That makes them a poor fit for most filesystems, which do many small in-place updates. But Magic Pocket's extents are append-only and immutable, written in large sequential chunks, a perfect match. With 14 TB SMR drives, one chassis reached about 1.4 PB.",
+    "deeper": "SMR is a good illustration of how design decisions made years earlier unlock hardware choices later. Because Magic Pocket was built around immutable blocks and append-only extents, it never needed to rewrite small regions, so the main drawback of shingled recording simply did not apply. A general-purpose filesystem, by contrast, constantly updates metadata and file contents in place, which on SMR would require rewriting large zones for each small change, destroying performance. The payoff is density: SMR drives store more per drive, which lowers cost per byte, and in Dropbox's deployment one chassis of 14 TB drives reached about 1.4 PB. This connects to the heat discussion earlier in the chapter. Denser drives make I/O per terabyte even scarcer, so they suit data that is written once, read occasionally and rarely rewritten, exactly the profile of most synced file blocks. The broader lesson is that immutability is not just a software convenience; it widens the range of cheap hardware a storage system can use.",
+    "quiz": {
+      "q": "Why were SMR drives a good fit for Dropbox but a poor fit for a general filesystem?",
+      "a": "SMR cannot rewrite small regions in place. Magic Pocket writes large append-only immutable extents; general filesystems do many small in-place updates."
+    }
+  },
+  {
+    "id": "ch03-060",
+    "chapter": 3,
+    "section": "3.5 Dropbox Magic Pocket and Backblaze Vaults",
+    "title": "Backblaze Vaults: 17+3 across 20 pods for 1.18x overhead",
+    "body": "Backblaze publishes its storage design openly. A Vault is 20 Storage Pods. Each file is split into 17 data shards plus 3 parity shards, with one shard on each pod. Drives in the same position across the 20 pods form a tome, and each file lives in one tome. A Vault survives up to three drive losses in a tome, or three pods offline. Overhead is 20 / 17, about 1.18x. With 20 TB drives, one Vault holds about 20.2 PB.",
+    "deeper": "Backblaze's very low overhead is the result of explicit choices. Wide stripes, 17 data shards for only 3 parity, keep the parity fraction small; compare Meta f4's 1.4x or the illustrative 1.5x needed to survive an Availability Zone loss at S3. Backblaze runs each vault in a single site, so there is no multi-AZ spread inside a vault that would require extra parity to survive a zone failure. And it uses cheap commodity pods rather than specialized hardware. The tome structure makes placement simple and failure domains clear: a file's 20 shards sit on the same drive slot across 20 pods, so each pod holds exactly one shard and any three pods can be offline for maintenance or failure without losing data. The trade-off is what a single-site design gives up. A disaster affecting the site affects the whole vault, and wide stripes mean rebuilding a lost shard requires reading from many pods. The comparison table summarizes Backblaze's main idea in three words: wide cheap stripes.",
+    "quiz": {
+      "q": "Why can Backblaze reach 1.18x overhead when S3-style multi-AZ designs need more?",
+      "a": "It uses very wide 17+3 stripes in a single site, with no need for extra parity to survive losing a whole zone, on cheap commodity pods."
+    }
+  },
+  {
+    "id": "ch03-061",
+    "chapter": 3,
+    "section": "3.6 Open source: MinIO and Ceph RGW",
+    "title": "MinIO: erasure sets, quorums, and no metadata database",
+    "body": "MinIO is an S3-compatible object server. Drives are grouped into erasure sets, by default 2 to 16 drives, and each object is Reed-Solomon coded across one set. With 16 drives, the default parity is EC:4, giving 75% usable capacity and tolerating 4 drive failures. Reads need a quorum of K healthy drives. Writes need K, or K+1 when parity is exactly half the set, to avoid split-brain, where two groups each believe they hold the latest data.",
+    "deeper": "K here is the number of data shards: with 16 drives and EC:4 parity, K is 12, so 12 of 16 drives must be healthy to read. Write quorum is normally also K, but when parity equals half the set, two disjoint halves of equal size could each accept conflicting writes, so MinIO requires K+1 to guarantee that any two write quorums overlap. MinIO's most distinctive choice is having no separate metadata database. Object metadata travels with the object, stored on the same drives. That keeps the system simple: there is no index service to scale, back up or keep consistent with the data. The cost shows up in listing and metadata-heavy operations, which must gather information from the drives themselves and so are more expensive than in systems with a dedicated index, like S3's sharded index layer or Ceph's bucket index. The comparison table summarizes MinIO as RS per erasure set, for example EC:4, with metadata stored with the object, and a main idea of simple, no metadata DB.",
+    "quiz": {
+      "q": "What does MinIO gain and lose by storing metadata with each object?",
+      "a": "It gains simplicity with no separate index service, but listing and metadata-heavy operations become more expensive than in systems with a dedicated index."
+    }
+  },
+  {
+    "id": "ch03-062",
+    "chapter": 3,
+    "section": "3.6 Open source: MinIO and Ceph RGW",
+    "title": "Ceph RGW: S3 on RADOS, and the bucket-index trap",
+    "body": "Ceph's RADOS Gateway, or RGW, exposes S3 and Swift APIs on top of RADOS, Ceph's distributed object layer. Objects are placed with the CRUSH algorithm, covered in Chapter 2. Bucket listings rely on a bucket index stored in RADOS objects. For big buckets that index must be sharded, and Ceph supports dynamic resharding. Unsharded or under-sharded bucket indexes are a well-known cause of slow writes on large RGW buckets. Multisite configuration replicates data between clusters.",
+    "deeper": "RGW illustrates the metadata-over-data pattern in open-source form: RADOS stores bytes, and a separate bucket index tracks which objects exist in each bucket so listings work. The index itself lives in RADOS objects, and every write to a bucket must update it. If one index object covers a huge bucket, it becomes a hotspot that every write must touch, and write performance drops as the bucket grows. Sharding spreads the index over many RADOS objects so updates can proceed in parallel. Dynamic resharding lets Ceph split the index as the bucket grows, similar in spirit to S3 splitting index partitions under load. Knowing this failure mode is practical operations knowledge: when a large RGW bucket suddenly slows down on writes, the bucket index sharding is a prime suspect. Placement with CRUSH means clients can compute where objects live rather than asking a central table, which removes a lookup service from the data path. Data protection comes from replication or erasure coding within RADOS, as the comparison table notes, and the main design idea is S3 API on a general object layer.",
+    "quiz": {
+      "q": "Why do large Ceph RGW buckets get slow writes when their index is unsharded?",
+      "a": "Every write updates the bucket index; one index object becomes a hotspot. Sharding the index spreads those updates across many RADOS objects."
+    }
+  },
+  {
+    "id": "ch03-063",
+    "chapter": 3,
+    "section": "3.6 Open source: MinIO and Ceph RGW",
+    "title": "Common mistake: S3-compatible does not mean behaves like S3",
+    "body": "A common mistake is assuming that a system advertised as S3-compatible behaves like Amazon S3. Compatibility usually means the same API calls work, not that the same guarantees hold. Consistency on overwrite and listing, request-rate scaling, listing performance on huge buckets, and support for newer APIs such as conditional writes and additional checksums all vary between implementations. The only safe approach is to test your real workload on the system you plan to use.",
+    "deeper": "Each of those areas maps to something the chapter showed is hard. S3 took 14 years and a verified cache coherence protocol to offer strong consistency for all GET, PUT, LIST and DELETE operations; another system might accept the same requests but return stale reads after an overwrite. S3 scales request rates by splitting index partitions per prefix; another system may have a fixed limit or a single hot index, like an under-sharded Ceph RGW bucket index. Listing speed depends on how metadata is stored: MinIO keeps metadata with objects, which is simpler but makes listing and metadata-heavy operations costlier than with a dedicated index. Newer features such as conditional writes, added to S3 in 2024, are precisely what table formats and lock-free coordination protocols rely on for atomic create-if-absent steps. If a compatible system silently ignores an If-None-Match header, a commit protocol built on it could corrupt data without raising any error. Testing should therefore cover the actual guarantees your application depends on, including concurrency and failure cases, not just whether basic uploads and downloads succeed.",
+    "quiz": {
+      "q": "Why is missing conditional-write support in an S3-compatible store dangerous?",
+      "a": "Table formats rely on If-None-Match for atomic commits. If the header is ignored, concurrent writers can overwrite each other without any error."
+    }
+  },
+  {
+    "id": "ch03-064",
+    "chapter": 3,
+    "section": "3.7 Comparison table",
+    "title": "Data protection compared: from 3.6x replicas to 1.18x stripes",
+    "body": "The chapter's comparison table shows how differently each system protects data. S3 uses Reed-Solomon across 3 or more Availability Zones with an 11 nines design. Azure uses synchronous replicas in a stamp, erasure codes sealed extents, and replicates asynchronously across regions. Meta Haystack used 3 replicas plus RAID-6 at 3.6x; f4 used RS(10,4) plus XOR across regions at 2.1x; Tectonic uses per-tenant RS, such as RS(9,6). Backblaze uses 17+3 across 20 pods at 1.18x.",
+    "deeper": "The remaining rows complete the picture. Google Cloud Storage relies on Colossus encodings, chosen per application by the Colossus client library. Dropbox Magic Pocket replicates first and then erasure codes, across 2 or more zones. MinIO uses Reed-Solomon per erasure set, for example EC:4. Ceph RGW uses replication or erasure coding within RADOS. Reading these side by side reveals the main levers. Overhead falls as stripes widen, from Haystack's 3.6x replication to Backblaze's 1.18x wide stripes. Overhead rises with the size of the failure you insist on surviving: a design meant to lose an entire Availability Zone or region needs more parity or cross-region schemes, while a single-site design like a Backblaze vault can use thin parity. Most systems also change protection as data ages: replicate while hot, erasure code once sealed or cooled, as with Azure, Magic Pocket and Meta's Haystack-to-f4 move. The public year column adds context: S3 from 2006, Google Cloud Storage from 2010, the Azure WAS paper from 2011, Haystack 2010, f4 2014, Tectonic 2021, Magic Pocket and Backblaze Vault 2015, and MinIO and Ceph RGW as open source.",
+    "quiz": {
+      "q": "Why can a Backblaze vault run at 1.18x while S3 needs more overhead?",
+      "a": "Backblaze uses wide stripes in a single site. S3 spreads shards across at least three AZs and must survive losing a whole zone, which demands more parity."
+    }
+  },
+  {
+    "id": "ch03-065",
+    "chapter": 3,
+    "section": "3.7 Comparison table",
+    "title": "Metadata compared: where each system keeps its index",
+    "body": "Every system in the chapter answers the question of where metadata lives differently. S3 uses its own sharded index plus witness-based cache coherence. Google Cloud Storage uses Spanner for permissions and location, and Bigtable for Colossus metadata. Azure uses a partition layer with range partitions. Haystack kept an in-memory needle index per machine. Tectonic uses ZippyDB, layered and hash partitioned. Magic Pocket uses a per-cell Master plus a block index. MinIO stores metadata with the object. Ceph RGW keeps a bucket index in RADOS.",
+    "deeper": "The main design idea column pairs with these metadata choices. S3: massive multitenancy, heat spread and formal checks with ShardStore. Google Cloud Storage: shared Google infrastructure and strong global consistency. Azure: stamps and an append-only stream layer. Haystack: one disk I/O per read. f4: a warm tier by object age, with metadata separate from Haystack. Tectonic: consolidate all tenants. Magic Pocket: immutable 4 MB blocks and SMR drives. Backblaze: wide cheap stripes with a tome-based layout. MinIO: simple, no metadata database. Ceph RGW: the S3 API on a general object layer. The metadata choice largely determines what is easy and what is hard. A dedicated, partitioned index, as in S3, Azure and Tectonic, makes listing and consistency tractable but must be scaled and protected from hotspots; S3 partitions by key range, Tectonic hashes to avoid hotspots. A globally consistent database like Spanner makes strong consistency natural. Keeping metadata with the object, like MinIO, is simplest but makes listing costly. An under-sharded index, like an RGW bucket index, becomes a write bottleneck.",
+    "quiz": {
+      "q": "What trade-off does a dedicated metadata index make compared with MinIO's approach?",
+      "a": "A dedicated index makes listing and consistency efficient but must be scaled and kept free of hotspots; storing metadata with objects is simpler but makes listing expensive."
+    }
+  },
+  {
+    "id": "ch03-066",
+    "chapter": 3,
+    "section": "Key takeaways",
+    "title": "Takeaways: immutability, index-last commits, verified code",
+    "body": "Object storage rests on immutable objects in a flat namespace. Immutability makes caching, replication and erasure coding simple, and makes in-place updates impossible. Every large object store separates a metadata or index layer from an append-only data layer, and commits a write by writing the index entry last. S3 reached strong consistency in 2020 using a witness as a read barrier, backed by proofs and model checking. ShardStore shows lightweight formal methods can be maintained by normal engineers and catch real crash bugs.",
+    "deeper": "These four ideas connect. Immutability is what makes the metadata-over-data split work: because data never changes after it is written, the data layer can be simple append-only storage and apply erasure coding once, while all coordination is concentrated in the index. Writing data first and the index entry last turns the index into the commit point, so a crash leaves only unreferenced garbage rather than a visible object with missing bytes. The same index layer is where consistency is decided, which is why S3's 2020 upgrade focused on keeping its metadata cache coherent: a small, in-memory witness tells caches when their view is stale, and AWS verified the protocol with deductive proofs and model checking, with verification effort exceeding implementation. ShardStore applies the same rigor to the storage node itself: an executable reference model about 1% of the code size, property-based testing with random crashes and disk failures, and model checking of concurrency, which prevented 16 issues from reaching production. Together they explain how a system built from failing parts can make strong promises.",
+    "quiz": {
+      "q": "Why does writing the index entry last make it the commit point?",
+      "a": "Readers only find objects through the index. If data is durable before the entry exists, a crash leaves only invisible garbage, never a visible object with missing bytes."
+    }
+  },
+  {
+    "id": "ch03-067",
+    "chapter": 3,
+    "section": "Key takeaways",
+    "title": "Takeaways: 11 nines, heat, prefixes, tiers, moving up the stack",
+    "body": "Eleven nines comes from erasure coding across Availability Zones, fast detection and repair, and processes like durability reviews that guard against software and human error. On hard drives, the scarce resource is I/O per byte, called heat, not capacity; S3 manages it with wide placement and workload decorrelation. S3 scales per prefix, so spread hot keys and retry 503s. Meta's Haystack, f4, Tectonic path shows three strategies. And object storage keeps moving up the stack.",
+    "deeper": "Each takeaway has a practical design-review question. On durability: beyond the coding scheme, how fast is repair, and what protects against bad deploys, garbage-collection bugs and operator mistakes, such as versioning, delayed deletion and formal checks? On heat: since a drive does about 120 random I/Os per second regardless of capacity, how will hot data be spread so no drive becomes a tail-latency hotspot? On request rates: S3 supports at least 3,500 writes and 5,500 reads per second per partitioned prefix, so does the key design spread load, or does a date-first prefix funnel everything into one partition? On tiering: what does the request-rate-by-age curve look like, and does it justify a cheaper tier, as it did for f4, where measuring access by age cut effective replication from 3.6x to 2.1x before Tectonic consolidated tenants to stop stranding resources? On the future: with S3 Express One Zone for low latency, S3 Tables for native Iceberg and S3 Vectors for embeddings, will object storage absorb the specialized system you are about to build?",
+    "quiz": {
+      "q": "Why is I/O per byte, not capacity, the scarce resource on hard-drive fleets?",
+      "a": "Drive capacity keeps growing while random I/O stays near 120 per second, so each terabyte gets less I/O every year."
+    }
+  }
+]

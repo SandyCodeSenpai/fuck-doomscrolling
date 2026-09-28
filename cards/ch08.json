@@ -1,0 +1,842 @@
+[
+  {
+    "id": "ch08-001",
+    "chapter": 8,
+    "section": "Chapter 8: Scaling Storage",
+    "title": "100,000 machines failing hourly is a different kind of system",
+    "body": "A storage system on one machine is easy. A storage system spread over 100,000 machines, in many regions, serving thousands of teams while machines fail every hour, is a different kind of system. Scaling it comes down to three big questions: how do we split the data (partitioning, splitting, rebalancing), where do we put each piece (placement, failure domains, heat), and how do we stay fast and fair as we grow (hot spots, tenants, regions, capacity, and tail latency).",
+    "deeper": "The chapter grounds every idea in one running example: a global app with 1 billion users that stores profiles, photos and videos, messages, logs and events, and analytics data. Each of those data types stresses a different part of the system. Photos and videos pile up into exabytes of bytes. Messages create bursts of writes at peak hours. Thumbnails create trillions of tiny objects. Many internal teams (search, ads, ML) want to share the same clusters. Users on every continent want low latency, and some of them live under laws that say their data must stay in their region.\n\nThe three questions build on one another. Splitting data into shards is the basic tool, but shards must then be placed so that no single failure destroys every copy and no single disk gets too much traffic. Finally, once the system is split and placed, it must keep working as load shifts: hot items appear, tenants collide, regions add speed-of-light delays, hardware must be bought months ahead, and fan-out requests are slowed by the single slowest server. The rest of the chapter takes these problems in that order.",
+    "quiz": {
+      "q": "What are the three big questions behind scaling a storage system?",
+      "a": "How to split the data (partitioning), where to put each piece (placement across failure domains and by heat), and how to stay fast and fair while growing (hot spots, tenants, regions, capacity, tail latency)."
+    }
+  },
+  {
+    "id": "ch08-002",
+    "chapter": 8,
+    "section": "8.1 What “scale” really means",
+    "title": "“It must scale” hides six different problems",
+    "body": "Saying a system must scale hides at least six separate problems, and each breaks a different part. Capacity (total bytes) fills disks and stretches rebuild times. IOPS and throughput saturate disk heads, NICs, and storage-node CPUs. Metadata operations (opens, lists, renames, lookups) overload the metadata service, often before data nodes. Object count bloats indexes and per-object memory. Tenants create fairness, isolation, and quota problems. Regions add latency, consistency, and legal constraints. Naming which dimension is growing tells you what will break first.",
+    "deeper": "The chapter maps each dimension onto the running 1-billion-user app. Capacity: photos and videos reach exabytes, so the pain is disks filling up and rebuild times growing as drives get bigger. IOPS: message writes at peak hours hammer disk heads, network cards, and CPUs on storage nodes. Metadata operations: listing a user's photo album is a metadata operation, and the metadata service often breaks before any data node does. Object count: trillions of small thumbnails blow up index size, memory per object, and directory size even though their total bytes are modest. Tenants: search, ads, and ML all share one cluster, so the question becomes who gets what and how one team is stopped from hurting another. Regions: EU users' data must stay in the EU, and cross-continent copies bring latency and consistency trade-offs.\n\nThe practical lesson is diagnostic. When someone says a design does not scale, ask along which axis. A design that handles 10x more bytes gracefully can still collapse at 10x more objects or 10x more tenants, because a different component is on the critical path for each.",
+    "quiz": {
+      "q": "Why is “the system must scale” an incomplete requirement?",
+      "a": "Scale has at least six dimensions (bytes, IOPS, metadata ops, object count, tenants, regions), and each one breaks a different component, so you must say which is growing."
+    }
+  },
+  {
+    "id": "ch08-003",
+    "chapter": 8,
+    "section": "8.1 What “scale” really means",
+    "title": "Bigger drives, same head: IOPS per terabyte keeps falling",
+    "body": "Bytes and operations scale separately. A 20 TB hard drive holds five times more data than a 4 TB drive, but it still has a single head arm that performs roughly the same 100 to 200 random IOPS (assuming a typical 7,200 RPM drive). So as drives grow, the IOPS available per terabyte shrinks. Cold data that is rarely read does not care. Hot data that is read often suffers badly, because far more data now competes for the same limited number of random operations.",
+    "deeper": "The mechanical reason is that a hard drive's random performance is set by seek time and rotation, not by platter density. Doubling capacity packs more bits under the same arm, but the arm still has to physically move and wait for the sector to spin around. The chapter's figure of about 100 to 200 random IOPS for a typical 7,200 RPM drive is an assumption, but the direction is what matters: IOPS per drive is roughly flat while terabytes per drive keep climbing.\n\nThis has design consequences that echo through the chapter. It is one reason placement must be heat-aware: if many hot objects land on the same big drive, that drive's small IOPS budget becomes a hot spot. It is why hyperscale object stores like S3 spread each tenant thinly across huge numbers of drives, so that no single drive sees too many hot requests. It is also why smaller systems must reserve IOPS headroom or move hot data to flash. Treating capacity planning as a bytes-only exercise will produce a cluster that has plenty of free space but cannot serve its traffic.",
+    "quiz": {
+      "q": "Why does buying larger hard drives make hot data perform worse per terabyte?",
+      "a": "Each drive keeps one head arm with roughly the same random IOPS, so more terabytes share the same IOPS budget and IOPS per terabyte falls."
+    }
+  },
+  {
+    "id": "ch08-004",
+    "chapter": 8,
+    "section": "8.1 What “scale” really means",
+    "title": "One billion tiny objects: 1 TB of data, a billion headaches",
+    "body": "Object count matters as much as total size. One billion 1 KB objects add up to only 1 TB, which fits on one drive, but they also create one billion metadata entries. Every entry costs index space, memory, and work when listing or looking things up. Many systems hit the limit of their metadata service long before they run out of disk. HDFS is the famous example: its single metadata server ran out of room for file entries while the data nodes still had plenty of free space.",
+    "deeper": "The core insight is that many costs are per object, not per byte. Metadata entries, index memory, directory sizes, and listing work all scale with how many things you store, regardless of how small each thing is. A system that easily handles 10x more bytes can still fail at 10x more objects, because the bottleneck moves from the data plane (which scales by adding disks) to the metadata plane (which needs consistency and often lives on fewer machines).\n\nIn the running example, trillions of small thumbnails are the threat. Their total bytes are modest compared with full-size videos, yet they could dominate metadata load. The chapter points back to Chapter 2 for HDFS, whose single NameNode held all metadata in memory and became the classic cautionary tale. Later in this chapter, Meta's Tectonic shows the fix at scale: metadata lives in a sharded key-value store and is sized for object count, with a representative cluster tracking 10.7 billion files and 15 billion blocks. When planning, always ask for the expected object count, not just the expected petabytes.",
+    "quiz": {
+      "q": "Why can a system that easily handles 10x more bytes still fail at 10x more objects?",
+      "a": "Many costs are per object, not per byte: metadata entries, index memory, listing work. The metadata service hits its limit long before the disks fill."
+    }
+  },
+  {
+    "id": "ch08-005",
+    "chapter": 8,
+    "section": "8.2 Partitioning: splitting data into pieces",
+    "title": "Sharding: the basic tool of scale",
+    "body": "Partitioning, also called sharding, means splitting a dataset into smaller pieces called partitions or shards. Each shard lives on one server or one replica group. It is the basic tool of scale: if one machine cannot hold or serve all the data, split it across many machines. Every sharded system must then answer one central question: for a given key, which shard owns it? There are four main answers: range partitioning, hash partitioning, consistent hashing, and directory-based partitioning.",
+    "deeper": "The four schemes trade off along a few axes: how evenly they spread keys, whether they keep range scans cheap, how much data moves when you add or remove capacity, and how much freedom you have to put a shard wherever you like.\n\nRange partitioning keeps sorted keys together, which makes scans cheap but invites hot spots. Hash partitioning spreads keys evenly but destroys ordering, and with a naive modulo it moves almost every key when the server count changes. Consistent hashing with virtual nodes limits movement to about 1/N of the data on a membership change. Directory-based partitioning keeps an explicit map from shard to servers, giving total freedom at the cost of a critical lookup service.\n\nThese are not mutually exclusive in practice. Many systems hash keys into a fixed number of logical shards and then use a directory to decide where each logical shard lives. Google's Slicer, for example, has applications hash keys into a large key space and then assigns ranges of that space to servers. Picking the right answer depends on your access pattern: scan-heavy workloads lean to ranges, point-lookup workloads lean to hashing.",
+    "quiz": {
+      "q": "What single question must every partitioning scheme answer?",
+      "a": "For a given key, which shard owns it? The four main answers are range, hash, consistent hashing, and directory-based lookup."
+    }
+  },
+  {
+    "id": "ch08-006",
+    "chapter": 8,
+    "section": "8.2 Partitioning: splitting data into pieces",
+    "title": "Range partitioning: sorted keys, cheap scans",
+    "body": "In range partitioning, each shard owns a continuous, sorted range of keys. For example, shard 1 owns user IDs from a to f, shard 2 owns f to m, and so on. A small table maps each range to its shard, and when a range grows too large it is split in two. The big advantage is that range scans are cheap: a query like all messages in this chat between time T1 and T2 touches only a few neighboring shards, because data sorted together stays together.",
+    "deeper": "Range partitioning is the model behind several well-known systems, each with its own name for a range: Bigtable calls them tablets, Spanner calls them splits, HBase calls them regions, and CockroachDB calls them ranges. The range-to-shard table is small because it only stores boundaries, not individual keys.\n\nSplitting is natural here: pick a split key in the middle of an oversized range and create two child ranges. Merging small adjacent ranges back together is also natural, and Spanner and CockroachDB both do it. Because the boundaries are explicit, the system can adapt to data that grows unevenly without rehashing anything.\n\nThe weakness is that the distribution of load follows the distribution of keys. If keys are uniformly spread and accessed evenly, ranges balance well after a few splits. If keys are skewed, such as timestamps or auto-incrementing IDs, all activity piles onto one end of the key space. The comparison table in the chapter rates range partitioning as needing splits for even spread, supporting range scans, moving only split ranges on resize, and offering medium flexibility.",
+    "quiz": {
+      "q": "Why is range partitioning a good fit for queries like messages in a chat between T1 and T2?",
+      "a": "Keys are stored sorted and contiguous, so a time-bounded scan touches only a few neighboring shards instead of every shard."
+    }
+  },
+  {
+    "id": "ch08-007",
+    "chapter": 8,
+    "section": "8.2 Partitioning: splitting data into pieces",
+    "title": "Timestamp keys turn range sharding into a one-server show",
+    "body": "The main weakness of range partitioning is that sequential keys create hot spots. If keys are timestamps or increasing IDs, every new write lands in the last range, because every new key is larger than all existing keys. One server takes all the writes while the rest of the cluster sits idle. Splitting that last range does not help much either: the new top range immediately becomes the hot one. The problem lies in the key design, not in the number of shards.",
+    "deeper": "This pattern shows up again and again in the chapter. DynamoDB's paper notes that a sequentially accessed key range will not benefit from split-for-consumption, and DynamoDB detects this pattern and avoids useless splits. The chapter's common-mistake box warns that auto-splitting fixes hot ranges but cannot fix a monotonically increasing key.\n\nThe standard fixes change the key rather than the partitioning. You can prefix keys with a hash so that consecutive writes scatter across the key space, or use randomized IDs instead of counters. The trade-off is that you lose some of the cheap-scan benefit: records written close together in time are no longer stored close together. Some designs accept this for write-heavy tables and keep range order only where scans truly matter.\n\nThe general lesson is to think about the write pattern of your key before choosing range partitioning. Range order is a feature for reads that scan and a liability for writes that always append to the same end.",
+    "quiz": {
+      "q": "Why doesn't splitting the hot range fix a timestamp-keyed hot spot?",
+      "a": "New keys always sort after existing ones, so after a split the new top range receives all the writes and becomes the hot spot again."
+    }
+  },
+  {
+    "id": "ch08-008",
+    "chapter": 8,
+    "section": "8.2 Partitioning: splitting data into pieces",
+    "title": "Hash partitioning: even spread, no range scans",
+    "body": "In hash partitioning, the system computes hash(key) and uses the result to pick a shard. The simplest form is hash(key) mod N, where N is the number of shards. Because a good hash scrambles keys, load spreads evenly even when the real keys are sequential, so timestamps no longer create one hot shard. The cost is that range scans disappear: keys that are neighbors in sorted order end up on random shards, so a range query must ask every shard.",
+    "deeper": "Hash partitioning is the natural choice for point-lookup workloads, where requests fetch one key at a time and never ask for a sorted range. It removes the append hot spot that plagues range partitioning with timestamp keys, because consecutive timestamps hash to unrelated values.\n\nThe trade-off is sharp. Any query that needs order or a range, such as the last hour of events, now has to scatter to every shard and gather the results. That multiplies load and exposes the query to the slowest shard, a problem the chapter returns to in the tail latency section.\n\nHash partitioning also does nothing about a single hot key. A viral video or a celebrity profile hashes to exactly one shard no matter what hash function you pick. Even spread is a property of many keys, not of one popular key.\n\nFinally, the plain modulo form has a serious operational flaw when the shard count changes, covered separately. That flaw is why real systems pair hashing with either fixed logical shards or consistent hashing rather than using raw hash mod N.",
+    "quiz": {
+      "q": "What do you gain and lose by switching from range to hash partitioning?",
+      "a": "You gain even load spread even for sequential keys; you lose cheap range scans, since neighboring keys land on random shards."
+    }
+  },
+  {
+    "id": "ch08-009",
+    "chapter": 8,
+    "section": "8.2 Partitioning: splitting data into pieces",
+    "title": "hash mod N: add one server, move 91 percent of your data",
+    "body": "Plain hash(key) mod N has a terrible property: when N changes, almost every key moves to a different shard. Going from 10 shards to 11 moves about 10/11, roughly 91 percent, of all keys, because most hash values now produce a different remainder. At petabyte scale, reshuffling nearly all data just to add one server is a disaster: it saturates the network for a long time and hurts user traffic. The chapter's comparison table labels hash mod N as fit only for simple caches, and says to avoid it.",
+    "deeper": "The math is simple. A key stays put only if hash(key) mod 10 equals hash(key) mod 11, which is true for only about 1 in 11 keys. Everything else must be copied to a new home. In a cache this is tolerable, since a miss just refetches from the source, which is why the table limits its use to simple caches. In a durable store, every moved key is real bytes on the network and disks, competing with user requests.\n\nThere are two widely used fixes. The first is to decouple keys from servers by hashing into a large, fixed number of logical shards and then assigning logical shards to servers; adding a server moves whole logical shards and never changes any key's shard. The second is consistent hashing, where adding or removing a server moves only about 1/N of the keys, those adjacent to the changed server on a hash ring.\n\nBoth fixes share the same idea: never let the physical server count appear directly in the formula that maps a key to its location.",
+    "quiz": {
+      "q": "With plain hash mod N, what fraction of keys move going from 10 to 11 shards, and why?",
+      "a": "About 10/11 (roughly 91 percent), because changing the divisor changes the remainder for almost every hash value; only about 1 in 11 keys keeps its shard."
+    }
+  },
+  {
+    "id": "ch08-010",
+    "chapter": 8,
+    "section": "8.2 Partitioning: splitting data into pieces",
+    "title": "Fixed logical shards: hash once, move shards not keys",
+    "body": "A common trick is to create many more logical shards than servers and never change the logical shard count. Keys are hashed into, say, 4,096 logical shards, and a separate mapping assigns logical shards to physical servers. When you add servers, you move whole logical shards to them; no key ever changes which logical shard it belongs to. Uber's Schemaless (2014 to 2016) used a fixed 4,096 logical shards on top of MySQL. Ceph does something similar with placement groups.",
+    "deeper": "This approach combines the even spread of hashing with cheap growth. The key-to-shard function is fixed forever, so there is never a mass reshuffle of individual keys. Only the shard-to-server mapping changes, and it changes in coarse, whole-shard units that are easy to copy, verify, and switch over.\n\nThe number of logical shards is a long-term commitment. It must be large enough that each server can hold several shards, so load can be balanced by moving individual shards, and so the system can grow to many more servers without a shard becoming larger than one server can handle. Uber chose 4,096 for Schemaless. Ceph's placement groups play the same role: objects hash into a fixed pg_num of groups per pool, and the CRUSH algorithm places groups, not objects, onto disks (Ceph's autoscaler can adjust pg_num as a pool grows).\n\nThe comparison table in the chapter rates this scheme as evenly spread, without range scans, moving whole shards only on resize, with medium flexibility, and lists Schemaless, Ceph PGs, and Vitess as users.",
+    "quiz": {
+      "q": "How do fixed logical shards avoid the mod-N reshuffle problem?",
+      "a": "The key-to-logical-shard mapping never changes; adding servers only moves whole logical shards between machines, so individual keys are never remapped."
+    }
+  },
+  {
+    "id": "ch08-011",
+    "chapter": 8,
+    "section": "8.2 Partitioning: splitting data into pieces",
+    "title": "Consistent hashing: a ring where only 1/N of data moves",
+    "body": "Consistent hashing fixes the almost-every-key-moves problem. Picture a ring of hash values from 0 to 2^64. Each server is placed at a point on the ring by hashing its name. Each key is hashed onto the same ring and belongs to the next server clockwise. When a server joins, it takes keys only from its one neighbor. When a server leaves, only its keys move, to its neighbor. On average only 1/N of the data moves when membership changes.",
+    "deeper": "The chapter's diagram shows the full lookup path. Take the key for user 42, hash it to a point on the ring, and walk clockwise to the next virtual node, say vnode A-17, which belongs to server A. Server A holds the primary replica. For more replicas, keep walking clockwise and pick the next distinct physical servers, B and then C, skipping any further vnodes that belong to A. This ensures the replicas land on different machines.\n\nThe key property is locality of change. Because each server owns only the arc just before its position, adding a server splits one arc, and removing a server merges its arc into the next. Nothing else on the ring is disturbed. Compare that with hash mod N, where changing N remaps almost everything.\n\nIn the chapter's comparison table, consistent hashing with virtual nodes gives even spread, no range scans, about 1/N data moved on resize, and medium flexibility. Its limitation is that ownership is dictated by hash positions, so you cannot freely place a particular shard by load, hardware type, or region.",
+    "quiz": {
+      "q": "When a server joins a consistent hashing ring, where does its data come from?",
+      "a": "Only from its clockwise neighbor, whose arc it splits. Everything else stays put, so on average only about 1/N of data moves."
+    }
+  },
+  {
+    "id": "ch08-012",
+    "chapter": 8,
+    "section": "8.2 Partitioning: splitting data into pieces",
+    "title": "Virtual nodes: fix a lumpy ring with many small arcs",
+    "body": "With only a few servers, the random points on a consistent hashing ring are uneven: one server might own 30 percent of the ring and another only 5 percent. The fix is virtual nodes, or vnodes. Each physical server is placed at many points on the ring, for example 100 to 256. Now every server owns many small arcs scattered around the ring, and the total ownership comes out close to even. Vnodes also let a bigger machine own more arcs than a smaller one.",
+    "deeper": "The statistics are straightforward: a few random points cut a circle into very unequal pieces, but the sum of many random pieces per server averages out. With 100 to 256 vnodes per server, the variance in ownership drops enough that no server is badly overloaded.\n\nVnodes bring two extra benefits. First, heterogeneous hardware becomes easy: give a machine with twice the capacity twice as many vnodes, and it takes twice the share of keys. Second, when a server leaves, its many small arcs are absorbed by many different neighbors instead of dumping all its load on one unlucky successor. The same is true in reverse when a server joins: it takes a little from many servers rather than a lot from one.\n\nWhen choosing replicas, a vnode-based system must walk past vnodes that belong to a physical server it has already chosen, so that replicas land on distinct machines. That detail, shown in the chapter's ring diagram, is easy to get wrong and would silently put two copies on one server.",
+    "quiz": {
+      "q": "Why do consistent hashing systems place each server at 100 to 256 points on the ring?",
+      "a": "A few random points split the ring unevenly; many small arcs per server average out to near-even ownership and let bigger machines take more arcs."
+    }
+  },
+  {
+    "id": "ch08-013",
+    "chapter": 8,
+    "section": "8.2 Partitioning: splitting data into pieces",
+    "title": "Dynamo made the ring famous; Discord uses it to coalesce",
+    "body": "Amazon's Dynamo paper (SOSP 2007) made consistent hashing with virtual nodes famous, and Cassandra, Riak, and many caches adopted the design. It lets any node compute where a key lives and keeps data movement small when nodes join or leave. Discord offers a modern twist: its Rust data service routes requests with consistent hashing by channel ID, so all requests for the same channel land on the same instance. That instance can then merge identical concurrent requests into one database query.",
+    "deeper": "Dynamo's contribution was showing that a large key-value store could be built with no central directory: every node knows the ring, so any node can route any request. The design influenced a generation of systems, notably Cassandra and Riak. The same paper is also known for keeping conflicting versions and letting the application merge them, which the chapter revisits in the multi-region section.\n\nDiscord's use is instructive because it treats consistent hashing as a routing tool, not only a storage layout. By sending every request for a given channel to the same service instance, Discord creates a single place where duplicate in-flight requests can be detected. If thousands of users open a busy channel at the same moment, the instance issues one query to the database and fans the result out to all waiters. This request coalescing is one of the chapter's answers to the single-hot-key problem, where splitting shards cannot help.\n\nThe limitation of pure consistent hashing, as the next sections show, is that it cannot place data by load, fault domain, or region on demand.",
+    "quiz": {
+      "q": "Why does Discord route requests by channel ID with consistent hashing?",
+      "a": "So all requests for the same channel reach the same instance, which can coalesce identical concurrent requests into one database query."
+    }
+  },
+  {
+    "id": "ch08-014",
+    "chapter": 8,
+    "section": "8.2 Partitioning: splitting data into pieces",
+    "title": "Directory partitioning: put any shard anywhere",
+    "body": "In directory-based, or lookup-based, partitioning, a separate service stores an explicit map, such as shard 1234 lives on servers X, Y, and Z. Clients ask the directory or cache its answers. The upside is total freedom: you can move any shard anywhere for any reason, including load, hardware type, failure domain, region, or cost, because no hash function dictates the mapping. The downside is that the directory becomes a critical dependency. It must be highly available, and clients must cope with stale maps.",
+    "deeper": "This is the model used by Google Slicer, Meta Shard Manager, LinkedIn Helix, and the placement layer of most large blob stores. Its flexibility is exactly what large operators need: they want to put a shard near its users, keep replicas in separate fault domains, give a hot shard to a lightly loaded machine, and drain a server before upgrading it. A hash function cannot express those choices.\n\nThe cost is operational. If the directory is down, clients that do not have a cached map cannot find data, so the directory must be replicated and highly available. Clients also cache the map for speed, which means they will sometimes send a request to a server that no longer owns the shard. The system needs a way to reject and redirect those requests, and the move protocol must fence writes during ownership changes so two servers never both think they own a shard.\n\nIn the chapter's comparison table, directory partitioning is rated as controlled spread, range scans depending on design, moving only what you choose on resize, and high flexibility.",
+    "quiz": {
+      "q": "What is the main price you pay for the flexibility of directory-based partitioning?",
+      "a": "The directory becomes a critical dependency that must be highly available, and clients must handle stale cached maps that point to the wrong server."
+    }
+  },
+  {
+    "id": "ch08-015",
+    "chapter": 8,
+    "section": "8.2 Partitioning: splitting data into pieces",
+    "title": "Five ways to shard, compared side by side",
+    "body": "The chapter compares five schemes. Range: needs splits for even spread, supports range scans, moves only split ranges on resize, medium flexibility (Bigtable, Spanner, HBase, CockroachDB). Hash mod N: even spread, no scans, moves almost everything on resize, low flexibility (simple caches only, avoid). Hash into fixed logical shards: even, no scans, whole shards move, medium (Schemaless, Ceph PGs, Vitess). Consistent hashing with vnodes: even, no scans, about 1/N moves, medium (Dynamo, Cassandra). Directory: controlled spread, scans depend, move only what you choose, high flexibility (Slicer, Shard Manager, Helix).",
+    "deeper": "Reading the table by column helps decisions. If you need range scans, range partitioning is the only scheme with a clear yes; directory-based systems can support scans only if their shards are ranges. If you need even spread without thinking, any hash-based scheme delivers it, but range partitioning needs active splitting.\n\nThe data-moved-on-resize column separates good from bad designs most sharply. Hash mod N moves almost everything and should be avoided outside simple caches. Fixed logical shards and consistent hashing both keep movement small, in different ways: one moves whole logical shards, the other about 1/N of keys. Directory-based systems move exactly what the operator or controller decides.\n\nThe flexibility column explains the industry trend covered next. Google, Meta, and LinkedIn all needed to place shards by load, fault domain, hardware, and region, and to drain servers before upgrades. Only the directory model offers high flexibility, so all three built central, directory-style shard managers, often layered on top of hashing into a large key space.",
+    "quiz": {
+      "q": "Which partitioning scheme should you avoid for durable storage, and why?",
+      "a": "Hash mod N: changing the shard count remaps almost every key, forcing a near-total data reshuffle. The table limits it to simple caches."
+    }
+  },
+  {
+    "id": "ch08-016",
+    "chapter": 8,
+    "section": "8.3 Shard management services: Slicer, Shard Manager, Helix",
+    "title": "Why Google, Meta, and LinkedIn built generic shard managers",
+    "body": "Every sharded system needs the same hard features: assign shards to servers, move them when servers die, balance load, and avoid dropping requests while shards move. Getting these right is difficult, and having every team rebuild them wastes effort and multiplies bugs. So large companies built generic shard managers: shared services that handle assignment, movement, and balancing for many applications at once. The three published examples are Google Slicer, Meta Shard Manager, and LinkedIn Helix.",
+    "deeper": "The chapter's In industry box summarizes the pattern: Google (Slicer, 2016), Meta (Shard Manager, 2020 to 2021), and LinkedIn (Helix, 2012) all chose a central, directory-style shard manager over pure consistent hashing. The reason was control. They needed to place shards by load, fault domain, and region, and to drain servers gracefully before upgrades. Consistent hashing fixes placement by hash position, which cannot express those goals.\n\nA generic shard manager also concentrates expertise. Handoff protocols, rate-limited moves, fencing during ownership changes, and failure detection are subtle, and one well-tested implementation serving hundreds of applications is more reliable than hundreds of partial ones. Meta's Shard Manager, for example, accounts for about 54 percent of sharded applications at Facebook.\n\nThe trade-off is that the shard manager becomes shared critical infrastructure. Its data plane, which routes requests, must be fast and highly available, while its control plane, which decides assignments, can be slower and off the request path. Slicer made that split its central design idea.",
+    "quiz": {
+      "q": "Why did Google, Meta, and LinkedIn pick directory-style shard managers over pure consistent hashing?",
+      "a": "They needed to place shards by load, fault domain, and region, and to drain servers before upgrades, which a hash ring cannot express."
+    }
+  },
+  {
+    "id": "ch08-017",
+    "chapter": 8,
+    "section": "8.3 Shard management services: Slicer, Shard Manager, Helix",
+    "title": "Slicer: split the fast data plane from the smart control plane",
+    "body": "Slicer (OSDI 2016) is Google's general-purpose auto-sharding service. Its key idea is separation. A data plane forwards each request to the right server, fast and reliably. A control plane watches load and server health and decides the assignment of work to servers, entirely off the request path. Applications hash their keys into a large key space. Slicer divides that space into ranges called slices and assigns slices to servers, so requests never wait on the slow, thoughtful balancing decisions.",
+    "deeper": "Separating the planes lets each be optimized for its job. The data plane only needs a current assignment table and must be quick and highly available, because every request passes through it. The control plane can gather load statistics, run balancing logic, and take its time, because a slightly delayed rebalancing decision does not slow any individual request.\n\nThe slice design combines hashing with a directory. Hashing keys into a large key space gives even distribution and hides skew in real keys. Assigning contiguous ranges of that hashed space, the slices, to servers gives the control plane something coarse to move. Slicer can then react to load in several ways: give a hot slice more replicas, split a slice that is too busy, or merge slices that are cold, all while trying to limit churn, meaning it avoids moving too much at once.\n\nLimiting churn matters because every move costs network bandwidth and risks a brief disruption. A balancer that chases every small fluctuation would spend more resources moving data than it saves, the same concern behind the chapter's warning about naive rebalancing.",
+    "quiz": {
+      "q": "What is the benefit of Slicer keeping its control plane off the request path?",
+      "a": "Slow balancing decisions never delay requests; the data plane just routes with the current assignment, fast and reliable, while the control plane rebalances in the background."
+    }
+  },
+  {
+    "id": "ch08-018",
+    "chapter": 8,
+    "section": "8.3 Shard management services: Slicer, Shard Manager, Helix",
+    "title": "Slicer's real win: 63 percent fewer resources than static shards",
+    "body": "The Slicer paper reports serving 2 to 7 million requests per second in production. The more important number is that the median Slicer-managed workload used 63 percent fewer resources than it would have with static sharding. The reason is that static sharding wastes capacity: every shard must be provisioned for its own peak, even though shards peak at different times. A dynamic sharder can move and replicate slices to follow load, so the fleet is sized for the combined load, not the sum of peaks.",
+    "deeper": "This is the economic argument for auto-sharding. In a static scheme, each shard gets a fixed server, and that server must handle its shard's worst moment. Across hundreds of shards, most servers are idle most of the time, waiting for a peak that happens occasionally. The total fleet equals the sum of every shard's peak.\n\nWith dynamic assignment, the control plane watches load and reacts: it splits a slice that is becoming hot, adds replicas to share read load, merges cold slices, and moves work onto less busy servers. The fleet only needs to cover the actual combined load plus some headroom. That difference, for the median workload, was 63 percent fewer resources.\n\nThe same idea reappears elsewhere in the chapter. DynamoDB moved from fixed per-partition throughput to table-level admission control and split-for-consumption because per-partition limits wasted capacity and throttled customers. S3 spreads tenants across millions of drives so bursts cancel out. Tectonic shares spare IOPS across tenants. In each case, flexibility in where load goes lets a system provision for aggregate demand rather than for every piece's worst case.",
+    "quiz": {
+      "q": "Why does static sharding waste capacity compared with Slicer-style dynamic sharding?",
+      "a": "Each static shard must be provisioned for its own peak; dynamic sharding moves and replicates slices to follow load, so the fleet is sized for combined demand."
+    }
+  },
+  {
+    "id": "ch08-019",
+    "chapter": 8,
+    "section": "8.3 Shard management services: Slicer, Shard Manager, Helix",
+    "title": "Meta Shard Manager: tens of millions of shards, 1M+ machines",
+    "body": "Meta's Shard Manager does the same job as Slicer at Meta. A 2020 blog post said it managed tens of millions of shards on hundreds of thousands of servers across hundreds of applications. The SOSP 2021 paper says it runs on over one million machines and accounts for about 54 percent of sharded applications at Facebook. Applications declare placement constraints, such as spread replicas across fault domains or keep a shard near its users, and Shard Manager balances multiple resources, including CPU, memory, and storage.",
+    "deeper": "Shard Manager treats placement as a constrained optimization problem. Each application states what it needs, and the system searches for an assignment that respects fault-domain spread, locality to users, and resource limits across several dimensions at once. Balancing only one resource, such as shard count, would leave some machines out of memory while others run out of CPU.\n\nThe paper is candid about a practical limit: a full constraint solver is too slow for near-real-time placement at global scale. When a server fails or load shifts, the system must respond in seconds, not hours. So practical systems use faster heuristics that find good-enough assignments quickly, rather than a perfect optimum too late.\n\nThe paper's first big observation also shapes the design: most applications need geo-distribution. A shard manager that only places within one cluster is not enough; it must place shards across regions, which ties shard management to the multi-region topics later in the chapter, such as leader placement and data residency.",
+    "quiz": {
+      "q": "Why do practical shard managers like Meta's use heuristics instead of a full constraint solver?",
+      "a": "A full solver is too slow for near-real-time placement at global scale; heuristics find good-enough assignments fast enough to react to failures and load changes."
+    }
+  },
+  {
+    "id": "ch08-020",
+    "chapter": 8,
+    "section": "8.3 Shard management services: Slicer, Shard Manager, Helix",
+    "title": "Planned restarts outnumber crashes 1,000 to 1",
+    "body": "Meta's Shard Manager paper made an observation that matters for all of storage: planned events, such as software upgrades, happen about 1,000 times more often than unplanned failures. So the most important feature of a shard manager is not recovering from a crash. It is moving shards and handing off primaries gracefully before a planned restart. If a system only handles failures well, every routine deploy looks like a failure to clients, which means constant small outages.",
+    "deeper": "The arithmetic behind this is intuitive once stated. A large fleet deploys new software frequently, and each deploy restarts many servers. Hardware crashes are comparatively rare. If each restart drops the shards on that server until clients time out and failover kicks in, the planned events dominate unavailability.\n\nThe better approach is to treat a planned restart as an opportunity to prepare. Before the process stops, the shard manager moves its shards elsewhere or promotes a replica on another server to primary, and only then lets the restart proceed. Clients see a clean handoff instead of errors and retries. This is also why rolling restarts appear as a feature in systems like LinkedIn's Venice, which uses Helix.\n\nThe chapter notes that it returns to this topic in Chapter 9 on operations. For design reviews, the takeaway is to ask not only how the system recovers from a crash but how it drains and hands off before a planned event, because that path runs about 1,000 times more often.",
+    "quiz": {
+      "q": "Why did Meta's Shard Manager paper emphasize planned events over failures?",
+      "a": "Planned events like upgrades happen about 1,000 times more often than unplanned failures, so graceful shard moves and primary handoff before restarts matter more for availability than crash recovery."
+    }
+  },
+  {
+    "id": "ch08-021",
+    "chapter": 8,
+    "section": "8.3 Shard management services: Slicer, Shard Manager, Helix",
+    "title": "Helix: state machines for every replica",
+    "body": "LinkedIn built Apache Helix, described at SoCC 2012 as a generic cluster management framework for partitioned, replicated resources. Helix models each replica with a state machine, for example OFFLINE, SLAVE, and MASTER, and computes the transitions needed when nodes join, fail, or restart. Instead of writing ad hoc failover code, an application defines its states and allowed transitions, and Helix orchestrates them across the cluster. LinkedIn's derived-data store Venice uses Helix for replica placement, rack awareness, rebalancing, and rolling restarts.",
+    "deeper": "Modeling replicas as state machines gives cluster management a precise vocabulary. Every replica is in a known state, and every change, such as promoting a replica to MASTER after the old one fails or taking a replica OFFLINE before a restart, is an explicit transition. Helix computes the target state of the whole cluster and issues the transitions required to reach it, respecting constraints such as at most one MASTER per partition.\n\nVenice shows the range of features this enables. Partition-replica placement decides which nodes hold which replicas. Rack-aware placement ensures copies of the same partition are not all in one rack, a failure-domain rule covered later in the chapter. Automatic rebalancing on failure moves replicas when nodes die. Rolling restarts let the cluster upgrade node by node without losing availability, which ties directly to Meta's observation that planned events vastly outnumber failures.\n\nHelix is the oldest of the three shard managers in the chapter, dating to 2012, and along with Slicer and Shard Manager it represents the industry's convergence on central, directory-style cluster management.",
+    "quiz": {
+      "q": "How does Helix decide what to do when a node joins, fails, or restarts?",
+      "a": "Each replica has a state machine (such as OFFLINE, SLAVE, MASTER); Helix computes the state transitions needed to reach a valid target cluster state and orchestrates them."
+    }
+  },
+  {
+    "id": "ch08-022",
+    "chapter": 8,
+    "section": "8.4 Automatic splitting, merging, and rebalancing",
+    "title": "Splitting and merging: reshape shards while serving traffic",
+    "body": "Data does not grow evenly. Some shards get big, some get hot, and some become nearly empty, so a scalable system must change its partitioning while still serving traffic. Splitting turns one shard into two; for range partitioning, you pick a split key and create two child ranges. The new child can start on the same server, so no data moves at first, and be moved later. Merging is the reverse: combining small adjacent shards to cut per-shard overhead.",
+    "deeper": "Starting a new child on the same server is a useful trick. A split then becomes a cheap metadata change: the boundaries are recorded, and both children keep serving from the same machine. Moving one child elsewhere is a separate, rate-limited rebalancing step that can happen when convenient. This keeps splits fast, which matters when a shard is becoming hot and needs relief quickly.\n\nMerging addresses the opposite problem. After many deletes, a system can be left with lots of tiny shards. Each shard carries fixed overhead regardless of its size: memory for bookkeeping, open file handles, and in consensus-based systems a Raft group with its own leader election and heartbeats. Thousands of nearly empty shards waste real resources. Spanner and CockroachDB both merge small adjacent ranges back together.\n\nBoth operations rely on range partitioning's explicit boundaries. In hash-based schemes with fixed logical shards, the equivalent move is reassigning whole logical shards among servers, since the shard boundaries themselves never change.",
+    "quiz": {
+      "q": "Why might a system merge shards instead of just leaving small ones alone?",
+      "a": "Each shard has fixed overhead (memory, file handles, a Raft group), so many tiny shards left after deletes waste resources; Spanner and CockroachDB merge small adjacent ranges."
+    }
+  },
+  {
+    "id": "ch08-023",
+    "chapter": 8,
+    "section": "8.4 Automatic splitting, merging, and rebalancing",
+    "title": "Moving a live shard in four steps",
+    "body": "Rebalancing moves shards between servers so each server carries a fair load. A shard move usually works in four steps. First, copy a snapshot of the shard to the new server. Second, stream new writes, the log, to the new server until it catches up. Third, briefly pause or fence writes, switch ownership in the directory, and resume. Fourth, delete the old copy after a safety delay. This keeps the shard available throughout, with only a tiny write pause at the switch.",
+    "deeper": "Each step has a purpose. The snapshot copies the bulk of the data while the old server keeps serving normally. Because writes continue during the copy, the snapshot is immediately stale, so the log stream replays new writes on the destination until it is nearly current. The fence in step three is the critical moment: writes are paused or rejected very briefly so that no write lands on the old owner after the new owner takes over. Ownership is switched in the directory, clients are redirected, and writes resume.\n\nThe safety delay in step four protects against mistakes. If the new copy turns out to be incomplete or the new server fails right away, the old copy is still there. Deleting it immediately would turn a routine move into potential data loss.\n\nThe same pattern underlies graceful handoff before planned restarts, which Meta found to be about 1,000 times more common than crashes, and DynamoDB's autoadmin moving replicas off overloaded storage nodes. Clients with stale cached maps must be able to get a redirect rather than an error.",
+    "quiz": {
+      "q": "Why fence writes briefly during the ownership switch when moving a shard?",
+      "a": "So no write lands on the old owner after the new owner takes over; otherwise writes could be lost or diverge between two servers that both think they own the shard."
+    }
+  },
+  {
+    "id": "ch08-024",
+    "chapter": 8,
+    "section": "8.4 Automatic splitting, merging, and rebalancing",
+    "title": "Common mistake: treating rebalancing as free",
+    "body": "A common mistake is treating rebalancing as free. Moving a shard copies real bytes over the network and reads and writes real disks. A naive balancer that sees a newly added, empty rack and fills it immediately can saturate the network for hours, starving user requests of bandwidth and pushing up latency across the cluster. The fix is to cap the move rate and watch user latency while moves run, so balancing happens gradually in the background instead of as a self-inflicted outage.",
+    "deeper": "Rebalancing competes with user traffic for the same resources: network links, disk heads, and CPU on storage nodes. When a new rack arrives, a greedy balancer sees a huge imbalance and tries to fix it all at once, launching many parallel copies. On hard drives with limited IOPS, and across shared top-of-rack and cluster links, that burst can dominate the hardware.\n\nThe chapter repeats the same discipline in several places. Slicer tries to limit churn, avoiding moving too much at once. The capacity planning section lists rate-limited rebalancing as a requirement for adding new racks continuously: new capacity must be filled gradually. Background work such as compaction, scrubbing, and rebalancing is also a named cause of tail latency, which is why Tectonic schedules background work in a lower TrafficClass.\n\nIn practice this means a move-rate limit, per-node limits on concurrent moves, and a feedback signal from user-facing latency. If latency climbs, the balancer slows down. The goal is not the fastest possible convergence but reaching balance without users noticing.",
+    "quiz": {
+      "q": "Why can adding a new empty rack hurt user latency?",
+      "a": "A naive balancer rushes to fill it, launching massive data copies that saturate network and disks for hours. Cap the move rate and watch user latency."
+    }
+  },
+  {
+    "id": "ch08-025",
+    "chapter": 8,
+    "section": "8.5 Data placement: CRUSH, placement groups, and failure domains",
+    "title": "Failure domains: three copies in one server protect almost nothing",
+    "body": "Partitioning decides which piece; placement decides which disks hold that piece's copies. Placement's main goal is that one failure never destroys all copies. A failure domain is a set of components that can fail together: a disk, a server, a rack (sharing a top-of-rack switch and power), a row, a power zone, a building, an availability zone, a region. Copies must spread across failure domains. Three copies on three disks in one server give almost no protection; three racks survive a rack failure; three zones survive a zone outage.",
+    "deeper": "The hierarchy of failure domains goes from small and frequent to large and rare. Disks fail most often, but a whole server can die from a bad power supply or motherboard, taking every disk inside with it. A rack shares a top-of-rack switch and power feed, so a switch or power failure takes out every server in it. Larger units, such as rows, power zones, buildings, availability zones, and regions, fail less often but take more with them.\n\nReplicas and erasure-coded fragments must both follow this rule. The protection you get is set by the smallest failure domain that contains all copies. Three copies in three zones survive a zone outage, but if all three zones share a region, a regional disaster still loses everything, which is why some data is also replicated across regions.\n\nPlacement systems encode failure domains explicitly. Ceph's CRUSH uses a cluster map tree like root, datacenter, rack, host, disk, with rules such as pick three different racks. LinkedIn's Venice uses Helix for rack-aware placement, and Meta's Shard Manager lets applications ask to spread replicas across fault domains.",
+    "quiz": {
+      "q": "Why do three replicas on three disks in the same server give almost no protection?",
+      "a": "The server is a failure domain: one power supply or motherboard failure takes all three disks at once. Copies must span separate failure domains like racks or zones."
+    }
+  },
+  {
+    "id": "ch08-026",
+    "chapter": 8,
+    "section": "8.5 Data placement: CRUSH, placement groups, and failure domains",
+    "title": "RS(10,4) math: why erasure coding stays inside one datacenter",
+    "body": "A Reed-Solomon RS(10,4) stripe splits data into 10 data fragments plus 4 parity fragments, 14 in total, and survives the loss of any 4. To survive a full rack failure, no rack may hold more than 4 of the 14 fragments, so you need at least 4 racks, arranged 4+4+4+2. Surviving a whole zone loss would likewise need at least 4 zones. That is why many systems use erasure coding inside a datacenter and full replication across regions.",
+    "deeper": "This back-of-envelope calculation turns the failure-domain rule into a concrete layout constraint. With RS(10,4), losing any 4 fragments is fine, but losing 5 is data loss. If one rack held 5 fragments, a single rack failure would destroy the stripe. Capping each rack at 4 fragments means 14 fragments need ceil(14/4) = 4 racks, laid out as 4, 4, 4, and 2.\n\nThe same logic applied to zones is expensive. Spreading one stripe over at least 4 zones means every read that needs 10 fragments must pull most of them across zone links, and every repair after a failure moves data between zones. Racks inside one datacenter share fast, cheap networking, so erasure coding works well there. Across regions, the network is slower and costlier, and a regional read needs data locally.\n\nThe common result is a two-level design: erasure coding within a datacenter for cheap durability against disk, server, and rack failures, and full replicas in other regions for regional disasters and local reads. Erasure coding also reappears as a tail-latency tool, since requesting extra fragments lets a reader ignore slow disks.",
+    "quiz": {
+      "q": "With RS(10,4), why do you need at least 4 racks to survive a rack failure?",
+      "a": "The stripe tolerates losing only 4 of 14 fragments, so no rack may hold more than 4; 14 fragments at 4 per rack needs at least 4 racks (4+4+4+2)."
+    }
+  },
+  {
+    "id": "ch08-027",
+    "chapter": 8,
+    "section": "8.5 Data placement: CRUSH, placement groups, and failure domains",
+    "title": "CRUSH: compute where data lives instead of looking it up",
+    "body": "Ceph's CRUSH (Controlled Replication Under Scalable Hashing, 2006) is a placement algorithm that computes data locations instead of looking them up in a table. The paper calls it a scalable pseudo-random data distribution function that maps data objects to storage devices without relying on a central directory, and distributes data according to user-defined policies that enforce separation of replicas across failure domains. Because every client holds the same cluster map, every client computes the same answer, with no central lookup on the read path.",
+    "deeper": "CRUSH sits between pure hashing and a directory. Like hashing, it is a deterministic function, so any client can find data without asking a server, which removes the directory as a bottleneck and single point of failure on reads. Unlike a plain hash, its input includes a description of the physical cluster and a policy, so the output respects failure domains.\n\nThe cluster map is a weighted tree, such as root, datacenter, rack, host, disk. Weights let bigger disks receive proportionally more data, which is what makes heterogeneous hardware work; the capacity planning section cites CRUSH weights as the model for mixing disk sizes during continuous add-and-retire.\n\nWhen a disk is added, CRUSH moves only a proportional share of placement groups to it rather than reshuffling everything, similar in spirit to consistent hashing. The trade-off compared with a directory is flexibility: placement follows the function and the map, so you cannot arbitrarily pin a specific group to a specific disk for load reasons. The chapter's takeaways contrast this: CRUSH computes placement from map and rules, while directory placement is more flexible and can be heat-aware.",
+    "quiz": {
+      "q": "Why does CRUSH not need a central directory on the read path?",
+      "a": "Every client has the same cluster map and rules, and CRUSH is deterministic, so every client computes the same list of disks for a placement group by itself."
+    }
+  },
+  {
+    "id": "ch08-028",
+    "chapter": 8,
+    "section": "8.5 Data placement: CRUSH, placement groups, and failure domains",
+    "title": "Object to PG to OSD: Ceph's two-step placement",
+    "body": "Ceph places data in two steps. First, object to placement group: hash the object name and map it to one of pg_num placement groups (PGs) in the pool, where a PG is a bucket of many objects. Second, placement group to OSDs: CRUSH takes the PG ID, the cluster map (a tree like root, datacenter, rack, host, disk, with weights), and a rule, such as pick 3 different racks, then 1 disk in each. It outputs the list of OSDs, meaning disks, that store that PG.",
+    "deeper": "The chapter's diagram walks through one object. Its name is hashed, and hash(name) mod pg_num selects placement group 7.3a. CRUSH is then called with three inputs: the PG ID, the cluster map of root, racks, hosts, disks, and weights, and a rule of 3 replicas in different racks. The output is OSD 12 in rack 1, OSD 88 in rack 4, and OSD 203 in rack 7, so the three copies land in three separate failure domains.\n\nNote the hash mod pg_num in step one. This is exactly the fixed-logical-shards pattern: pg_num is the fixed logical count, and objects map to PGs by a simple function. Growth is handled in step two, where CRUSH remaps PGs onto the changing set of disks. Only whole PGs move when disks are added or removed.\n\nThe rule language is what enforces failure-domain separation. Changing the rule, for example to pick 3 different datacenters, changes the protection level without changing how objects map to PGs.",
+    "quiz": {
+      "q": "What are Ceph's two mapping steps from object to disk?",
+      "a": "The object name is hashed to one of pg_num placement groups; then CRUSH maps the PG to a set of OSDs using the cluster map and a placement rule."
+    }
+  },
+  {
+    "id": "ch08-029",
+    "chapter": 8,
+    "section": "8.5 Data placement: CRUSH, placement groups, and failure domains",
+    "title": "Placement groups: track hundreds of groups, not millions of objects",
+    "body": "Why place placement groups instead of individual objects? Tracking millions of objects one by one, each with its own location and replication state, is too costly. PGs group many objects so the system tracks and peers a manageable number of groups. Ceph's docs say mon_target_pg_per_osd defaults to 100 PGs per disk and recommend about 200, warning that values above 500 can cause excessive peering traffic and memory use. An autoscaler can change pg_num as the pool grows.",
+    "deeper": "Peering is the process where the OSDs holding a PG agree on its current state, for example after a disk restarts. It happens per PG, so the number of PGs directly sets the coordination overhead. Too few PGs per disk and data spreads unevenly, since each PG is a coarse chunk, and recovery after a failure involves few disks working in parallel. Too many PGs and every OSD spends memory and network on bookkeeping and peering chatter, which is why Ceph warns against going above 500 per OSD.\n\nThe defaults reflect this balance: target 100, recommended about 200. Because the right pg_num depends on how many OSDs a pool spans and how much data it holds, Ceph provides an autoscaler that adjusts pg_num as the pool grows, rather than requiring operators to guess once and live with it forever.\n\nThe general lesson matches the chapter's theme about counting objects, not only bytes: any per-item cost at scale must be amortized by grouping items into larger units that the control plane can manage.",
+    "quiz": {
+      "q": "Why does Ceph place placement groups instead of individual objects?",
+      "a": "Tracking and peering millions of objects individually is too costly; PGs group objects so the system manages hundreds of groups per disk instead."
+    }
+  },
+  {
+    "id": "ch08-030",
+    "chapter": 8,
+    "section": "8.5 Data placement: CRUSH, placement groups, and failure domains",
+    "title": "Heat: S3 spreads each customer across a million disks",
+    "body": "Placement for durability is only half the job; the other half is heat. In Andy Warfield's 2023 description of Amazon S3, heat means the number of requests hitting a given disk at any point in time. Bad placement lets many hot objects land on one drive and create a hot spot. S3 deliberately puts different objects onto different sets of drives so that each customer's accesses spread over a very large number of disks. A single customer workload might be served by over a million disks.",
+    "deeper": "Heat-aware placement follows from the IOPS-per-terabyte problem earlier in the chapter. Big hard drives have few random IOPS relative to their capacity. If an unlucky placement puts several hot objects on the same drive, that drive's small IOPS budget is exhausted and requests queue, even though the fleet as a whole has plenty of spare capacity.\n\nS3 avoids this by making placement a load-spreading tool. Rather than keeping a customer's objects together, it deliberately scatters them across different drive sets. The result is that each customer touches a vast number of disks, and each disk carries a thin slice of many customers' traffic. When one customer gets busy, the extra load is divided among so many drives that no single drive is pushed over the edge.\n\nThis requires a directory-style placement layer that can decide freely where each object goes. The chapter's takeaways note that directory-based placement is more flexible than computed placement and can be heat-aware, whereas a fixed function like CRUSH optimizes for failure-domain separation and even capacity.",
+    "quiz": {
+      "q": "What does heat mean in S3's placement design, and why does it matter?",
+      "a": "Heat is the number of requests hitting a disk at a given time; if hot objects cluster on one drive, its limited IOPS become a hot spot despite fleet-wide spare capacity."
+    }
+  },
+  {
+    "id": "ch08-031",
+    "chapter": 8,
+    "section": "8.5 Data placement: CRUSH, placement groups, and failure domains",
+    "title": "At huge scale, bursts cancel out",
+    "body": "Warfield's key insight about S3 is aggregation. Individual workloads are very bursty, but once you aggregate enough of them, it becomes difficult or impossible for any single workload to influence the combined peak. At huge scale, independent bursts tend to cancel out: while one customer spikes, others are quiet. Because each drive serves a thin slice of very many customers, drive-level demand becomes smooth and predictable. This is an advantage small clusters simply do not have, since they serve too few workloads for bursts to average away.",
+    "deeper": "The statistics resemble insurance. One household's claims are unpredictable, but the claims of millions of households are stable. Likewise, a single tenant's request rate might jump by orders of magnitude within seconds, yet the sum across a huge population of independent tenants barely moves.\n\nS3 turns this into engineering by combining two things: enormous scale, with a single customer workload possibly touching over a million disks, and deliberate spreading, so every disk mixes traffic from many unrelated customers. The spreading ensures each disk sees the aggregate, not any individual workload. The aggregate is smooth, so disks can run closer to their limits without frequent overload.\n\nThe same principle explains why Slicer saves resources over static sharding and why multi-tenancy saves money in general: one team's idle capacity serves another team's peak. The catch, emphasized in the chapter's senior staff lens, is that this benefit depends on scale. A cluster with a handful of large tenants will see their bursts add up rather than cancel, so it must reserve explicit headroom instead.",
+    "quiz": {
+      "q": "Why can a hyperscale object store tolerate very bursty individual customers?",
+      "a": "Spreading each customer over huge numbers of drives means each drive sees the aggregate of many independent workloads, whose bursts cancel out, so no single workload moves the peak."
+    }
+  },
+  {
+    "id": "ch08-032",
+    "chapter": 8,
+    "section": "8.5 Data placement: CRUSH, placement groups, and failure domains",
+    "title": "Senior staff lens: cheap slow drives work only at huge scale",
+    "body": "Heat-aware placement is why a hyperscale object store can use big, slow, cheap hard drives. Each drive offers few IOPS, but spreading every tenant thinly across millions of drives means no single drive receives too many hot requests. When you design a smaller system, you do not get this for free. Without millions of drives and countless independent tenants, bursts do not cancel out. You must instead reserve IOPS headroom on your drives or put hot data on flash.",
+    "deeper": "This lens is a warning against copying hyperscaler architecture without its scale. A design review might see that S3 runs on dense hard drives and conclude that a smaller internal object store can do the same. The economics that make this work, very low IOPS per terabyte offset by statistical smoothing across a huge fleet, do not transfer to a cluster of a few hundred drives with a few dozen tenants.\n\nIn a smaller system, one tenant's burst can land on a noticeable fraction of the drives, and a few simultaneous bursts can overload them. The two remedies named in the chapter each cost money in a different way. Reserving IOPS headroom means buying more drives than capacity alone would require, so you pay for spindles you keep idle. Using flash for hot data means paying more per terabyte for media with far more IOPS, and adding tiering logic to decide what is hot.\n\nThe honest design question is which of these you are paying for, and whether your capacity model counts IOPS as well as bytes, per the chapter's first lesson that bytes and operations scale separately.",
+    "quiz": {
+      "q": "Why can't a small storage cluster copy S3's strategy of cheap, slow hard drives for hot data?",
+      "a": "It lacks the scale for bursts to cancel out across millions of drives, so it must reserve IOPS headroom or place hot data on flash."
+    }
+  },
+  {
+    "id": "ch08-033",
+    "chapter": 8,
+    "section": "8.6 Hot spots: detecting and splitting them",
+    "title": "Hot spots: celebrities, viral videos, and timestamp keys",
+    "body": "A hot spot, or hot partition, is a shard that receives much more traffic than others. Common causes include a celebrity profile that millions of people view, a viral video, a sequential key such as a timestamp where every new write hits the same end, a big customer whose traffic dwarfs everyone else's, and a batch job scanning one range. Hot spots matter because a system's capacity is only as good as its busiest shard: one overloaded server can throttle or slow requests while the rest of the cluster sits idle.",
+    "deeper": "The causes fall into distinct types that need different fixes, which is the thread running through the rest of this section. A hot range, where many different keys in one range are busy, can be fixed by splitting the range so the load divides between two servers. A single hot key, like one celebrity's profile or one viral video, cannot be split; it needs caching, read replicas, request coalescing, or key salting. A sequential key pattern, like timestamps, just moves the hot spot to the newest range after each split; it needs a different key design.\n\nA big customer and a batch job are really multi-tenancy problems. They are handled by admission control, quotas, and priority classes, as in DynamoDB's table-level token buckets and Tectonic's traffic classes.\n\nDetecting hot spots requires per-shard monitoring of consumed throughput and, ideally, a histogram of which keys inside the shard are busy. DynamoDB's design uses exactly that signal to decide whether a split will help and where to split. Knowing which type of hot spot you have is the first step to picking the right defense.",
+    "quiz": {
+      "q": "Why can't one fix handle every kind of hot spot?",
+      "a": "Hot ranges can be split, but a single hot key cannot be divided and sequential keys just move the hot end; each type needs a different defense."
+    }
+  },
+  {
+    "id": "ch08-034",
+    "chapter": 8,
+    "section": "8.6 Hot spots: detecting and splitting them",
+    "title": "DynamoDB step 1: static splits and throughput dilution",
+    "body": "Early DynamoDB divided a table's provisioned throughput evenly across partitions. The paper's example: if one partition can hold at most 1,000 write capacity units (WCUs) and a table has 3,200 WCUs, DynamoDB created four partitions of 800 WCUs each. This assumed uniform access, but real workloads are uneven over time and key ranges. Two problems appeared: hot partitions, where traffic keeps hitting a few items, and throughput dilution. Customers were throttled even when their table's total capacity was high enough.",
+    "deeper": "DynamoDB's 2022 USENIX ATC paper is one of the best public accounts of hot-spot handling, because it shows the design evolving step by step, with each step fixing the previous step's failure.\n\nThroughput dilution is the subtle problem. When a partition grew too large and was split for size, its throughput was split as well. If most traffic went to one half, that hot half now had only half the capacity it had before the split, even though nothing about the customer's workload or total provisioned capacity had changed. Growth in data made the hot keys slower.\n\nThe root cause was enforcing limits at the partition level. The paper quotes that application workloads frequently have non-uniform access patterns both over time and over key ranges. Dividing a table's capacity evenly means any partition carrying more than its share is throttled, while capacity assigned to cold partitions goes unused. The customer sees throttling errors while paying for enough throughput overall, which is exactly the static-sharding waste Slicer's paper measured.",
+    "quiz": {
+      "q": "What is throughput dilution in early DynamoDB?",
+      "a": "Splitting a partition for size also split its throughput, so a hot half received less capacity than before the split and got throttled despite ample table capacity."
+    }
+  },
+  {
+    "id": "ch08-035",
+    "chapter": 8,
+    "section": "8.6 Hot spots: detecting and splitting them",
+    "title": "DynamoDB step 2: bursting and adaptive capacity",
+    "body": "DynamoDB's first fixes were bursting and adaptive capacity. Bursting let a partition use unused capacity saved from up to the last 300 seconds, provided the storage node also had spare capacity. This absorbed short spikes. Adaptive capacity watched for long-lived skew and boosted the throughput of partitions that stayed hot. Both helped, but both had limits: they were reactive, kicking in only after throttling had started, and they were still tied to per-partition limits, so the underlying design flaw remained.",
+    "deeper": "Bursting treats unused capacity like a savings account. If a partition was quiet for a while, it banked its unused throughput for up to 300 seconds and could spend it during a short spike. The condition that the storage node also have spare capacity matters: bursting borrows from the physical machine, so it cannot promise capacity the node does not have.\n\nAdaptive capacity targeted the other failure pattern, where a partition stays hot for a long time. It detected sustained skew and raised the hot partition's limit. That reduced throttling for stable hot spots.\n\nThe paper's judgment is that both mechanisms were patches on the wrong abstraction. Because the enforcement unit was still the partition, a hot partition had to be noticed and boosted after the fact, and customers could still see throttling before the system reacted. The next step changed the enforcement unit itself, moving limits from partitions to tables. Bursting's effect of packing nodes beyond their provisioned totals also created the need for step 5, balancing consumed capacity across storage nodes.",
+    "quiz": {
+      "q": "Why were bursting and adaptive capacity not a complete fix for DynamoDB hot partitions?",
+      "a": "Both were reactive, responding only after skew appeared, and still tied to per-partition limits, so the flawed enforcement unit remained."
+    }
+  },
+  {
+    "id": "ch08-036",
+    "chapter": 8,
+    "section": "8.6 Hot spots: detecting and splitting them",
+    "title": "DynamoDB step 3: global admission control",
+    "body": "DynamoDB replaced adaptive capacity with global admission control (GAC), a service that tracks token buckets at the table level. Request routers keep local token buckets and refill them from GAC every few seconds. Now the throughput limit is enforced for the table as a whole, not per partition, so a hot partition can use the table's unused capacity from cold partitions. Partition-level token buckets remain as defense in depth, preventing any one partition from overwhelming a storage node.",
+    "deeper": "A token bucket is a simple rate limiter: tokens refill at a fixed rate, each request takes a token, and an empty bucket means reject or delay. GAC applies this at the right level. The customer pays for table throughput, so the table is what gets limited. Traffic can shift freely among partitions as long as the table total stays within budget, which directly cures throughput dilution.\n\nThe distributed design keeps it fast. Checking a central service on every request would add latency and create a bottleneck, so request routers hold local buckets and replenish them from GAC every few seconds. Most requests are admitted locally, and GAC only coordinates the totals.\n\nKeeping partition-level buckets is important in a multi-tenant service. Storage nodes host thousands of replicas from unrelated customers, and DynamoDB caps partition-level buckets to ensure one application does not consume all or a significant share of a node's resources. GAC gives a customer flexibility across its partitions; the partition caps protect everyone else on the same hardware. GAC alone still cannot help when a single partition needs more than one node can provide, which step 4 addresses.",
+    "quiz": {
+      "q": "How did global admission control fix throughput dilution?",
+      "a": "It enforces limits at the table level via router token buckets refilled from GAC, so a hot partition can use unused table capacity instead of a fixed per-partition share."
+    }
+  },
+  {
+    "id": "ch08-037",
+    "chapter": 8,
+    "section": "8.6 Hot spots: detecting and splitting them",
+    "title": "DynamoDB step 4: split for consumption, not just size",
+    "body": "Even with table-level limits, one partition can need more throughput than one storage node can deliver. So DynamoDB splits partitions based on consumed throughput. Once a partition's consumed throughput crosses a threshold, it is split for consumption, and the split point is chosen from the key distribution the partition has observed, so the load, not just the data, divides between the children. Splits usually complete in minutes. DynamoDB also detects cases where splitting cannot help, a single hot item or a sequential key range, and avoids those useless splits.",
+    "deeper": "The chapter's flowchart shows the logic. Monitor each partition's consumed throughput and a key histogram. If traffic is below the split threshold, keep monitoring. If above, check whether the traffic is on a single key or a sequential range. If yes, do not split; rely on admission control and caching. If no, choose a split point from the observed key distribution, create two child partitions, and move a child to a less loaded node if needed.\n\nChoosing the split point from observed traffic is what distinguishes this from a size split. A size split picks the middle of the data; a consumption split picks the point that divides the requests evenly, which may be far from the data midpoint.\n\nThe exclusions are principled. Splitting divides a key range between two partitions, but one key cannot be divided, so a single hot item would remain entirely in one child. A sequential pattern, where all traffic hits the newest keys, just moves the hot end into whichever child holds the top of the range. Splitting in those cases wastes work and adds partitions without relieving load.",
+    "quiz": {
+      "q": "Why does split-for-consumption not help with a single hot item or a sequential key pattern?",
+      "a": "One key cannot be divided, so it stays in one child; a sequential pattern just moves the hot end to the new child. Caching, replicas, or key design are needed."
+    }
+  },
+  {
+    "id": "ch08-038",
+    "chapter": 8,
+    "section": "8.6 Hot spots: detecting and splitting them",
+    "title": "DynamoDB step 5: rebalance the nodes, not just the partitions",
+    "body": "Once partitions could burst and share table-level capacity, DynamoDB's storage nodes ended up packed beyond their provisioned totals: the sum of what their replicas might use could exceed what the node could deliver. So each storage node monitors the throughput its replicas actually consume. When a node crosses a threshold, an autoadmin service moves some replicas to other nodes. This balances consumed capacity across the fleet, so flexible per-partition usage does not overload any single machine.",
+    "deeper": "This step closes the loop created by the earlier ones. Static per-partition limits had one virtue: a node's worst-case load was known, because every partition had a hard cap. Bursting and table-level admission control removed that certainty, letting individual partitions use more than their original share. That flexibility is good for customers but means a node can be oversubscribed if several of its partitions spike at once.\n\nRather than going back to rigid limits, DynamoDB accepted overbooking and added active balancing. Nodes watch real consumption, and when one runs hot, the autoadmin service relocates replicas using the same kind of live-move process described in the rebalancing section, copying data and switching ownership without downtime.\n\nThe overall arc of DynamoDB's evolution, from static partition limits to bursting, then table-level admission control, split-for-consumption, and consumption-based balancing, mirrors the chapter's broader lesson. Per-partition limits cause throttling under skew. Table-level admission control plus split-for-consumption fixes most skew, and balancing keeps nodes healthy, but none of it fixes a single hot key.",
+    "quiz": {
+      "q": "Why did DynamoDB need to rebalance replicas based on consumed capacity?",
+      "a": "Bursting and table-level limits let partitions exceed their old shares, so nodes became packed beyond provisioned totals; moving replicas off hot nodes prevents overload."
+    }
+  },
+  {
+    "id": "ch08-039",
+    "chapter": 8,
+    "section": "8.6 Hot spots: detecting and splitting them",
+    "title": "You can't split a key: four defenses for one hot item",
+    "body": "Splitting cannot help when a single key is hot, because you cannot split a key. The common answers: caching in front, such as memcache or a CDN for photos, which is the main defense for reads. Read replicas of the hot shard; Slicer can assign more replicas to hot slices. Request coalescing: Discord's Rust data service merges identical concurrent requests so the database sees one query instead of thousands. And for writes, key salting, which spreads one hot key across several sub-keys.",
+    "deeper": "Each defense targets a different shape of load. Caching removes reads from the storage system entirely. A viral photo served from a CDN never reaches the storage node, which is why it is the main read defense. Read replicas spread the remaining reads across several servers holding the same data; Slicer's ability to give a hot slice more replicas is an automated form of this.\n\nRequest coalescing attacks duplication. When thousands of clients ask for the same thing at the same moment, most of those requests are redundant. Discord routes by channel ID with consistent hashing so that all requests for one channel reach the same instance, which can then merge identical in-flight requests into a single database query and share the result.\n\nWrites are the hardest case, because caches and read replicas do nothing for them. Key salting, covered next, handles hot counters by spreading writes. In DynamoDB's flowchart, the no-split path for a single hot key explicitly says to rely on admission control and caching, which matches this list.",
+    "quiz": {
+      "q": "Why is caching the main defense against a single hot key for reads?",
+      "a": "Splitting cannot divide one key, but a cache or CDN serves repeated reads before they reach storage, removing the load entirely."
+    }
+  },
+  {
+    "id": "ch08-040",
+    "chapter": 8,
+    "section": "8.6 Hot spots: detecting and splitting them",
+    "title": "Key salting: split a hot counter into 16 sub-keys",
+    "body": "Key salting handles a single hot key under heavy writes. Instead of one counter such as likes:video123, the application writes to N sub-keys, for example likes:video123:0 through likes:video123:15, choosing one at random or by rotation for each increment. The sub-keys hash to different shards, so the writes spread across many servers. To read the total, the application reads all sub-keys and sums them. The cost is that the application must know about the salting; the database will not do it automatically.",
+    "deeper": "Salting turns one hot key into many lukewarm ones. With 16 sub-keys, each shard sees roughly one sixteenth of the write load, and the hot spot disappears as long as 16 servers can carry the total.\n\nThe trade-offs are real. Reads become more expensive: a single logical read now fans out to N sub-keys, which multiplies read work and exposes the read to the slowest of N responses, the tail latency effect discussed at the end of the chapter. Salting therefore suits write-heavy, read-light data such as like counters, view counts, or event tallies. It is a poor fit for data that is read constantly.\n\nThe application complexity is the other cost. Every writer and reader must use the same scheme and the same N, and changing N later requires care. Sums across sub-keys are also not atomic snapshots unless extra coordination is added.\n\nThe broader principle from the chapter's common-mistake box is to design keys so that writes spread, using a hash prefix or randomized IDs, and to cache hot reads, rather than hoping the database will fix hot keys by itself.",
+    "quiz": {
+      "q": "What is the trade-off of salting a hot counter into N sub-keys?",
+      "a": "Writes spread across N shards, removing the hot spot, but every read must fetch and sum all N sub-keys, and the application must implement the scheme."
+    }
+  },
+  {
+    "id": "ch08-041",
+    "chapter": 8,
+    "section": "8.6 Hot spots: detecting and splitting them",
+    "title": "Common mistake: “the database auto-splits, so we're fine”",
+    "body": "A common mistake is assuming the database auto-splits, so hot spots are solved. Auto-split fixes hot ranges, where many keys in one range are busy. It does not fix a single hot key, because one key cannot be divided. It also cannot fix a monotonically increasing key, such as a timestamp, because every split just leaves the newest range hot. The fix is design, not hope: shape keys so writes spread, using a hash prefix or randomized IDs, and cache hot reads.",
+    "deeper": "This mistake is common because auto-splitting is a real and useful feature, and database documentation rightly advertises it. DynamoDB's split-for-consumption, Spanner and CockroachDB range splits, and Bigtable tablet splits all handle hot ranges well, usually within minutes. It is easy to generalize that into a belief that the database handles all hot spots.\n\nDynamoDB's own paper spells out the limits: a single hot item or a sequentially accessed key range will not benefit from splitting, and DynamoDB detects these patterns and deliberately avoids useless splits. In other words, even the most advanced auto-splitter explicitly gives up on these two cases.\n\nThe responsibility therefore lands on schema and key design. For write patterns, avoid monotonically increasing keys as the leading part of the key, prefixing a hash or using random IDs instead. For hot individual items, plan caching, read replicas, request coalescing, or key salting from the start. In a design review, ask which keys could become hot, such as a celebrity, a viral item, or the current time bucket, and what happens when they do.",
+    "quiz": {
+      "q": "Why doesn't database auto-splitting solve every hot spot?",
+      "a": "It only fixes hot ranges. A single hot key cannot be divided, and monotonically increasing keys keep the newest range hot after each split."
+    }
+  },
+  {
+    "id": "ch08-042",
+    "chapter": 8,
+    "section": "8.7 Metadata scaling, revisited",
+    "title": "Metadata belongs in a sharded database, not one server's RAM",
+    "body": "The data plane scales by adding disks, but the metadata plane is harder: it needs consistency, and its access is skewed toward popular files and directories. Two lessons follow. First, put metadata in a scalable database, not in one server's memory: Google's Colossus stores metadata in Bigtable, and Meta's Tectonic stores it in ZippyDB, a sharded key-value store. Second, hash-partition metadata to avoid hot spots. Tectonic splits metadata into name, file, and block layers and hash-partitions each one.",
+    "deeper": "Chapter 2 covers metadata services in depth; this section distills the scaling lessons. The single-server design, as in HDFS, holds all metadata in one machine's memory, which caps the number of files at what that memory can hold and makes that server a throughput bottleneck. Moving metadata into a sharded database removes both limits: capacity and throughput grow with the database's shard count.\n\nTectonic's layering is a clever application of partitioning. The name layer maps paths and directories to files, the file layer maps files to blocks, and the block layer maps blocks to storage locations. Each layer is a separate set of key-value tables, and each is hash-partitioned independently. The paper says this effectively avoids hotspots in the metadata layer.\n\nHash partitioning matters because metadata access is naturally skewed. A range-partitioned namespace would put a busy directory, and all its children, on one shard. Hashing spreads that load. The price is the usual one for hashing: operations that walk a directory in order or touch many related entries may need to visit several shards.",
+    "quiz": {
+      "q": "Why does Tectonic hash-partition each layer of its metadata?",
+      "a": "Metadata access is skewed toward popular files and directories; hash partitioning spreads those hot entries across shards, which the paper says effectively avoids metadata hotspots."
+    }
+  },
+  {
+    "id": "ch08-043",
+    "chapter": 8,
+    "section": "8.7 Metadata scaling, revisited",
+    "title": "10.7 billion files in one cluster: size metadata for the count",
+    "body": "The third metadata lesson is to count objects, not only bytes. A representative Meta Tectonic cluster in 2021 had 1,590 PB of capacity, 1,250 PB used, 10.7 billion files, and 15 billion blocks, all on 4,208 storage nodes. That is billions of metadata items in a single cluster. Whatever holds that metadata must be sized for the number of items it tracks, not for the number of petabytes, because every file and block is an entry to store, index, and look up.",
+    "deeper": "The numbers make the point concrete. Petabytes of capacity are served by a few thousand storage nodes, since each node holds many large drives. But the metadata system must track tens of billions of entries across files and blocks, and every read or write touches some of them. A metadata design sized by bytes, for example one node per few petabytes, would be hopelessly undersized for the entry count.\n\nThe same cluster snapshot appears again in the capacity planning section: 1,250 PB used out of 1,590 PB is about 70 percent full, consistent with the rule that distributed storage must never run near full.\n\nThis connects to the chapter's opening table, where object count is listed as a separate scale dimension from capacity, breaking index size, memory per object, and directory size. It is also why grouping techniques matter: Tectonic tracks blocks rather than smaller units, and Ceph tracks placement groups rather than objects, to keep per-item overhead manageable. When planning a storage system, ask for expected files and blocks, and size the metadata tier for that number.",
+    "quiz": {
+      "q": "Why must Tectonic's metadata system be sized by item count rather than by petabytes?",
+      "a": "Every file and block is a metadata entry to store and look up; one cluster had 10.7 billion files and 15 billion blocks, far beyond what byte-based sizing implies."
+    }
+  },
+  {
+    "id": "ch08-044",
+    "chapter": 8,
+    "section": "8.8 Multi-tenancy and noisy neighbors",
+    "title": "Multi-tenancy: shared hardware, shared pain",
+    "body": "A tenant is a user of the storage system with its own identity, quota, and expectations: a team, an application, or an external customer. Multi-tenancy means many tenants share the same hardware. It saves huge amounts of money, because one team's idle capacity can serve another team's peak instead of every team buying for its own worst case. But it creates the noisy neighbor problem: one tenant's burst, such as a large batch job, can hurt everyone else's latency on the shared machines.",
+    "deeper": "Multi-tenancy is the organizational version of the aggregation effect seen in S3: independent demands peak at different times, so a shared pool needs less total hardware than separate pools sized for each peak. In the running example, search, ads, and ML all share one cluster, and the savings are large.\n\nThe noisy neighbor problem is the other side of the same coin. Sharing means one tenant's resource use directly affects others: the same disks, network links, and metadata servers serve everyone. A background analytics scan can fill disk queues that a user-facing service depends on. Because the tenants have different owners and priorities, the problem is as much organizational as technical.\n\nThe chapter's answer, developed in the next cards, is a set of isolation tools, quotas, token-bucket admission control, priority classes with fair scheduling, and physical isolation for the largest tenants, plus explicit decisions about which resources are guaranteed and which are best-effort. Meta's Tectonic and Amazon DynamoDB provide the concrete examples. The senior staff lens frames it bluntly: multi-tenancy is an economic decision with a reliability cost.",
+    "quiz": {
+      "q": "What is the noisy neighbor problem, and why does multi-tenancy create it?",
+      "a": "When tenants share hardware, one tenant's burst consumes shared disks, network, or metadata capacity and raises everyone else's latency."
+    }
+  },
+  {
+    "id": "ch08-045",
+    "chapter": 8,
+    "section": "8.8 Multi-tenancy and noisy neighbors",
+    "title": "Four tools to keep tenants from hurting each other",
+    "body": "Storage systems isolate tenants with four main tools. Quotas set hard limits on bytes, objects, or request rate per tenant. Admission control with token buckets limits request rates: tokens refill at a fixed rate, each request takes one, and an empty bucket means reject or delay the request. Priority classes and fair scheduling at each storage node decide whose requests go first when resources are contended. Physical isolation, separate clusters or cells, is reserved for the biggest or most sensitive tenants.",
+    "deeper": "The tools work at different time scales and strengths. Quotas are coarse and slow-changing, suited to capacity, which Tectonic calls a non-ephemeral resource. Token buckets handle rates and allow short bursts up to the bucket size while enforcing a long-run average, which is why they appear throughout the chapter: DynamoDB's global admission control is built on table-level token buckets, with partition-level buckets as defense in depth.\n\nPriority classes and fair scheduling deal with the moment of contention on a single node. When a disk queue is full, the scheduler decides which tenant's request is served next. Without it, whoever sends the most requests wins. Tectonic's weighted round-robin scheduler with Gold, Silver, and Bronze traffic classes is the chapter's example.\n\nPhysical isolation is the strongest and most expensive tool. Separate clusters or cells eliminate interference but give up the pooling savings that motivate multi-tenancy in the first place. That is why it is reserved for tenants large enough to justify their own hardware or sensitive enough that sharing is unacceptable. Most systems combine several of these tools.",
+    "quiz": {
+      "q": "How does a token bucket limit a tenant's request rate?",
+      "a": "Tokens refill at a fixed rate and each request consumes one; when the bucket is empty, requests are rejected or delayed, allowing short bursts but capping the average rate."
+    }
+  },
+  {
+    "id": "ch08-046",
+    "chapter": 8,
+    "section": "8.8 Multi-tenancy and noisy neighbors",
+    "title": "Tectonic: capacity is reserved, IOPS is shared",
+    "body": "Meta's Tectonic (FAST 2021) divides resources into two kinds. Non-ephemeral resources, mainly storage capacity, change slowly and, once given to a tenant, cannot be shared, since bytes on disk belong to someone. These are managed with quotas. Ephemeral resources, such as storage IOPS and metadata query capacity, have demand that changes quickly, moment to moment. These must be shared dynamically, because reserving them statically would leave most of them idle while other tenants starve.",
+    "deeper": "The distinction answers a practical question: which resources should be guaranteed and which should be pooled? Capacity is naturally exclusive. If tenant A stores a petabyte, that space is taken until A deletes the data; no amount of scheduling lets tenant B use it in the meantime. So a quota, a fixed allocation that changes on planning timescales, is the right tool.\n\nIOPS and metadata operations are the opposite. An IOPS not used this second is gone forever, and one tenant's demand may swing from zero to peak within seconds. Carving them into fixed per-tenant slices would waste most of the fleet's performance, the same waste that static sharding and DynamoDB's per-partition limits suffered from.\n\nTectonic's answer is to give each tenant a guaranteed quota of ephemeral resources, so every tenant can count on a baseline, and then to redistribute unused ephemeral capacity dynamically. The next card covers exactly how spare capacity flows, first within a tenant by traffic class, then to other tenants. This hybrid gives both predictability and efficiency.",
+    "quiz": {
+      "q": "Why does Tectonic manage storage capacity with quotas but share IOPS dynamically?",
+      "a": "Capacity changes slowly and cannot be shared once used, so quotas fit; IOPS demand swings quickly and unused IOPS are lost, so they must be pooled dynamically."
+    }
+  },
+  {
+    "id": "ch08-047",
+    "chapter": 8,
+    "section": "8.8 Multi-tenancy and noisy neighbors",
+    "title": "Gold, Silver, Bronze: Tectonic's traffic classes",
+    "body": "Inside each Tectonic tenant, applications are grouped into about 50 TrafficGroups per cluster, and each TrafficGroup has a TrafficClass: Gold for latency-sensitive, Silver for normal, and Bronze for background work. Each tenant gets a guaranteed quota of ephemeral resources such as IOPS. Spare capacity flows first to the tenant's own TrafficGroups by class, then to other tenants. Storage nodes run a weighted round-robin scheduler that skips a TrafficGroup's turn if it would exceed its limit, and lets lower-class requests yield to Gold requests.",
+    "deeper": "TrafficGroups give Tectonic a manageable unit of isolation. Instead of tracking thousands of individual applications, it tracks about 50 groups per cluster, each with a class that encodes how urgent its requests are.\n\nThe spare-capacity order reflects ownership and priority. A tenant's unused guarantee benefits its own groups first, in class order, so its Gold work is covered before its Bronze. Only then does leftover capacity flow to other tenants. This rewards tenants for their guarantee while still keeping the fleet busy.\n\nOn each storage node, weighted round-robin serves groups in turn according to their weights, but skips a group whose next request would push it over its limit, so a greedy group cannot monopolize the disk. The yielding optimization lets a Bronze or Silver request step aside when a Gold request is waiting, protecting latency-sensitive traffic.\n\nThis design is also a tail-latency tool: the chapter recommends scheduling background work, such as compaction and repair, at lower priority, as Tectonic's TrafficClasses do. The key takeaways summarize it: multi-tenancy needs guaranteed quotas plus priority classes for shared, ephemeral resources.",
+    "quiz": {
+      "q": "How does Tectonic's scheduler protect Gold traffic on a busy storage node?",
+      "a": "Weighted round-robin skips any TrafficGroup that would exceed its limit, and lower-class requests yield to waiting Gold requests, so latency-sensitive work goes first."
+    }
+  },
+  {
+    "id": "ch08-048",
+    "chapter": 8,
+    "section": "8.8 Multi-tenancy and noisy neighbors",
+    "title": "Shared clusters paid off: 10x fewer warehouse clusters",
+    "body": "Tectonic's isolation design made consolidation possible. By moving blob storage and the data warehouse onto shared Tectonic clusters, Meta reduced the number of data warehouse clusters by 10x, and the warehouse could absorb traffic spikes using blob storage's spare IOPS. DynamoDB faces the same challenge in a public service: storage nodes host thousands of replicas from unrelated customers, so it caps partition-level token buckets to ensure one application does not consume all or a significant share of a node's resources.",
+    "deeper": "The Tectonic result shows why the isolation machinery is worth building. Blob storage and the data warehouse have complementary profiles: blob storage holds huge volumes of data with IOPS to spare, while warehouse workloads are spiky. Once they share clusters with guaranteed quotas and traffic classes, the warehouse's spikes are absorbed by capacity that would otherwise sit idle in blob storage. Meta reported a 10x reduction in warehouse clusters.\n\nDynamoDB shows the same tension in a harder setting. Meta's tenants are internal teams that can be negotiated with; DynamoDB's tenants are external customers who never see each other and expect predictable performance. Global admission control gives each customer flexibility across its own partitions, but the partition-level token bucket cap exists specifically so that one customer's hot partition cannot take over a storage node shared with thousands of other customers' replicas.\n\nIn both cases, the savings of sharing depend on enforcement. Without quotas, scheduling, and caps, consolidation would turn into constant noisy-neighbor incidents rather than a 10x efficiency gain.",
+    "quiz": {
+      "q": "Why does DynamoDB keep partition-level token bucket caps even with table-level admission control?",
+      "a": "Storage nodes host thousands of replicas from unrelated customers, so caps stop one application's hot partition from consuming all or a large share of a node's resources."
+    }
+  },
+  {
+    "id": "ch08-049",
+    "chapter": 8,
+    "section": "8.8 Multi-tenancy and noisy neighbors",
+    "title": "Senior staff lens: multi-tenancy is economics with a reliability bill",
+    "body": "Multi-tenancy is an economic decision with a reliability cost. Before sharing a cluster, ask: What is the isolation unit, the tenant, the application, or the request class? Which resources are guaranteed and which are best-effort? What happens to a Gold request when the cluster is full of Bronze work? Who pays for headroom? If nobody can answer these questions, the shared cluster will become a political problem the first time a batch job hurts a user-facing service.",
+    "deeper": "This lens reframes multi-tenancy from a technical feature to an agreement between teams. The savings are real, as Tectonic's 10x consolidation shows, but they come from people sharing resources they would otherwise control alone. When something goes wrong, the questions become who caused it, whose work should have been protected, and who should have paid to prevent it.\n\nEach question maps to a design decision earlier in the chapter. The isolation unit is what Tectonic's TrafficGroups and DynamoDB's tables and partitions define. Guaranteed versus best-effort is Tectonic's split between guaranteed ephemeral quotas and redistributed spare capacity. The Gold-versus-Bronze question is about scheduling and preemption, answered by weighted round-robin with yielding. Headroom is about budget: someone must fund spare capacity so that bursts and repairs do not hurt guaranteed tenants.\n\nThe warning at the end is practical. Without written answers, the first incident where a batch job slows a user-facing service turns into an argument about blame and priority rather than a quick application of agreed policy.",
+    "quiz": {
+      "q": "What happens if a shared storage cluster has no agreed answers about isolation units and guarantees?",
+      "a": "The first time a batch job hurts a user-facing service, it becomes a political fight over blame and priority instead of applying an agreed policy."
+    }
+  },
+  {
+    "id": "ch08-050",
+    "chapter": 8,
+    "section": "8.9 Going global: multi-region storage",
+    "title": "70 to 80 ms: the speed-of-light floor for global writes",
+    "body": "A 1-billion-user app has users on every continent. Light in fiber needs roughly 70 to 80 ms for a round trip between the US East Coast and Western Europe, using typical published figures. A strongly consistent write that must reach a quorum spread across continents cannot complete faster than that, no matter how good the software is. This physical limit shapes every multi-region design: each one decides which operations pay the cross-region round trip and which stay local.",
+    "deeper": "The number is a floor, not an estimate of real latency. Actual round trips include routing, queuing, and processing, so they are higher. Consensus protocols may also need more than one round trip per write. The key point is that software cannot beat physics: if a write must be acknowledged by replicas on two continents, it will take at least one intercontinental round trip.\n\nThe rest of the section is a toolbox for living with this limit. Asynchronous replication keeps writes local and pays for it with possible data loss and conflicts. Synchronous replication pays the round trip in exchange for no data loss and strong consistency. Leader placement puts the write-ordering replica close to the writers so most writes stay fast. Akkio-style migration moves data to follow its users. Conflict resolution techniques, such as last-writer-wins, vector clocks, and CRDTs, handle concurrent writes in async designs, and home regions avoid conflicts altogether.\n\nData residency laws add a legal constraint on top of physics: some data cannot simply be placed wherever latency is best.",
+    "quiz": {
+      "q": "Why can't a strongly consistent cross-continent write be faster than about 70 to 80 ms?",
+      "a": "It must reach a quorum spread across continents, and light in fiber needs roughly 70 to 80 ms for a US East to Western Europe round trip."
+    }
+  },
+  {
+    "id": "ch08-051",
+    "chapter": 8,
+    "section": "8.9 Going global: multi-region storage",
+    "title": "Sync vs async replication: pay in latency or in lost writes",
+    "body": "Synchronous replication acknowledges a write only after a quorum in multiple regions has it. Writes pay a cross-region round trip, but a region failure loses no data (RPO = 0) and strong consistency is possible. Examples: Spanner multi-region and Physalia-style designs. Asynchronous replication acknowledges once the local region has the write, so latency is local only, but recent writes can be lost if the region fails, and consistency is eventual with possible conflicts. Examples: DynamoDB global tables, Cassandra multi-DC with local quorum, most blob geo-replication.",
+    "deeper": "Two terms frame the trade-off. RPO, recovery point objective, is how much recent data you can afford to lose. RTO, recovery time objective, is how long you can afford to be down. Synchronous replication achieves RPO = 0 because no write is acknowledged until it exists in several regions. Asynchronous replication has a nonzero RPO: writes acknowledged locally but not yet shipped are lost if that region disappears.\n\nConsistency follows the same split. With synchronous quorums, a read can be guaranteed to see the latest write. With asynchronous replication, other regions lag behind, and if two regions accept writes to the same item concurrently, the system must resolve conflicts later.\n\nThe chapter's key takeaway puts it simply: multi-region design is a choice between write latency and data loss. Many real systems mix both, using synchronous replication for critical metadata or small, important records, and asynchronous replication for bulk data like photos and logs, where a few seconds of possible loss or staleness is acceptable in exchange for local write speed.",
+    "quiz": {
+      "q": "What is the core trade-off between synchronous and asynchronous multi-region replication?",
+      "a": "Synchronous pays a cross-region round trip per write but loses nothing on region failure (RPO = 0); asynchronous keeps writes local but can lose recent writes and allows conflicts."
+    }
+  },
+  {
+    "id": "ch08-052",
+    "chapter": 8,
+    "section": "8.9 Going global: multi-region storage",
+    "title": "Spanner: put writers next to the default leader region",
+    "body": "Many strongly consistent systems have a leader per shard that orders writes, and where that leader lives decides write latency. Google Spanner makes this explicit. A regional configuration has three read-write replicas in different zones of one region. Multi-region configurations spread read-write replicas across regions, plus a witness region that votes but holds no full data copy. Each configuration has a default leader region that handles writes, and Google advises placing compute for write-heavy workloads within or close to that region.",
+    "deeper": "The advice follows from the physics. Every write goes through the shard's leader, so a writer far from the leader pays a long round trip on every write before consensus even starts. Placing application servers in or near the default leader region keeps that hop short.\n\nThe witness region is an economical way to get a majority vote across regions without paying for another full copy of the data. It participates in consensus, helping the system tolerate a regional failure, but does not store all the data.\n\nGoogle describes the multi-region trade-off as faster reads in more places at the cost of a small increase in write latency. Reads can be served by nearby replicas, while writes need agreement across regions.\n\nSpanner also offers dual-region configurations that keep all replicas inside one country, which exist for data residency: they allow regional failure tolerance and failover without data leaving the permitted jurisdiction. This connects leader placement to the legal constraints covered later in the section.",
+    "quiz": {
+      "q": "Why does Google advise placing write-heavy compute near Spanner's default leader region?",
+      "a": "Every write is ordered by the shard's leader, so a writer far from the leader region adds a long round trip to every write."
+    }
+  },
+  {
+    "id": "ch08-053",
+    "chapter": 8,
+    "section": "8.9 Going global: multi-region storage",
+    "title": "Akkio: move each user's data to where they are",
+    "body": "Rather than fixing a leader region, a smarter approach moves leaders, or whole data, to where they are used. Meta's Akkio (OSDI 2018) groups related data into u-shards, for example all of one user's data, and migrates them between datacenters to follow access patterns. If a user starts accessing from a different region, their data moves closer. The paper reports up to 50 percent lower access latency, up to 50 percent less cross-datacenter traffic, and up to 40 percent less storage, managing over 100 PB in production.",
+    "deeper": "Akkio's insight is that the right unit for locality is not the database shard but a group of data that is accessed together. A u-shard, such as one user's data, is small enough to move cheaply and coherent enough that moving it brings all related accesses local. Database shards, by contrast, contain many unrelated users with different locations, so no single placement suits all of them.\n\nThe comparisons are against reasonable alternatives such as keeping full replicas everywhere or fixed placement. Lower latency comes from serving users from a nearby datacenter. Less cross-datacenter traffic comes from not fetching remote data on every access. Less storage comes from not keeping full copies in every region just in case a user shows up there.\n\nThe approach fits the chapter's broader theme that directory-style, movable placement beats fixed hash-based placement at scale. Meta's Shard Manager paper similarly found that most applications need geo-distribution, so placement must span regions. Akkio also complements the home-region idea in conflict resolution: a user's data has a home, and that home can move with the user.",
+    "quiz": {
+      "q": "What is Akkio's u-shard, and why migrate it instead of whole database shards?",
+      "a": "A u-shard groups related data, such as one user's; moving it follows that user's access, whereas database shards mix users in many locations."
+    }
+  },
+  {
+    "id": "ch08-054",
+    "chapter": 8,
+    "section": "8.9 Going global: multi-region storage",
+    "title": "Last-writer-wins: simple, popular, and silently lossy",
+    "body": "With asynchronous multi-region writes, two regions can update the same item at the same time, and the system must choose a result. Last-writer-wins (LWW) attaches a timestamp to each write and keeps the latest. It is simple and widely used, for example in Cassandra's per-column timestamps and DynamoDB global tables. The costs: with clock skew between machines, a write that truly happened later can carry an earlier timestamp and silently lose. And if the unit is a whole item, concurrent updates to different fields overwrite each other.",
+    "deeper": "LWW's appeal is that it needs no coordination and no application logic: every replica applies the same rule and converges on the same value. That is why it is the default in many eventually consistent systems.\n\nThe first cost comes from clocks. Different machines' clocks drift, so timestamps from two regions are not perfectly comparable. If region A's clock runs slightly fast, its writes win even when region B wrote afterward. The losing write simply disappears with no error, which makes these bugs hard to notice.\n\nThe second cost is granularity. If a user updates their display name in one region while updating their photo in another, and the system treats the whole profile as one unit, one of those changes is lost even though they touched different fields. Cassandra reduces this by keeping timestamps per column, so concurrent updates to different columns both survive.\n\nLWW works well when overwrites are acceptable, such as a latest-status field, and poorly when every write matters, such as counters or carts, where the other techniques in this section are better choices.",
+    "quiz": {
+      "q": "How can last-writer-wins silently lose a write that really happened later?",
+      "a": "Clock skew can give the later write an earlier timestamp, so the replicas keep the other write and discard it without any error."
+    }
+  },
+  {
+    "id": "ch08-055",
+    "chapter": 8,
+    "section": "8.9 Going global: multi-region storage",
+    "title": "Vector clocks: keep both versions, let the app merge",
+    "body": "The Dynamo paper (2007) took a different approach to conflicts: use vector clocks to detect when two versions were written concurrently, keep both conflicting versions, and let the application merge them. The classic example is a shopping cart: if two regions each added an item to the same cart, the application merges both carts so neither item is lost. This is powerful, because no write is silently discarded, but it pushes complexity onto developers, who must write correct merge logic for every data type.",
+    "deeper": "A vector clock tracks, per replica, how many updates each version has seen. Comparing two vector clocks tells the system whether one version descends from the other, in which case the newer one simply replaces it, or whether they were written independently, in which case they are true conflicts. Unlike LWW timestamps, this does not depend on synchronized wall clocks.\n\nWhen a true conflict exists, Dynamo does not guess. It returns both versions to the application on the next read, and the application decides how to combine them. For a shopping cart, taking the union of items is a sensible merge, though it can bring back an item a user deleted in one region.\n\nThe cost is that every application must handle conflicts correctly, for every kind of data it stores, and bugs in merge logic can corrupt data. That burden is one reason many later systems chose simpler LWW semantics, or moved to CRDTs, which bake a well-defined merge into the data type itself, or avoided conflicts entirely with single-writer home regions.",
+    "quiz": {
+      "q": "What is the trade-off of Dynamo's approach of keeping conflicting versions for the app to merge?",
+      "a": "No write is silently lost, but every application must implement correct merge logic for its data, pushing significant complexity onto developers."
+    }
+  },
+  {
+    "id": "ch08-056",
+    "chapter": 8,
+    "section": "8.9 Going global: multi-region storage",
+    "title": "CRDTs: data types that always merge cleanly",
+    "body": "CRDTs, Conflict-free Replicated Data Types, are data types designed so that merging replicas is always well-defined and all replicas converge to the same value, no matter the order in which updates arrive. Examples include counters, sets, maps, and registers. They are a good fit for likes counters, presence indicators, and collaborative editing, where many regions update concurrently. The limit: not every business rule can be expressed as a CRDT. A rule like balance must not go below zero needs coordination.",
+    "deeper": "CRDTs move merge logic from the application into the data type. A counter CRDT, for example, can track increments per region and sum them, so concurrent increments in different regions never overwrite each other and every replica eventually reports the same total. Because the merge is mathematically guaranteed to converge, replicas can accept writes locally with no coordination and still agree once updates propagate.\n\nThis makes CRDTs attractive for the running example's social features: likes, view counts, online-presence flags, and collaborative documents all involve many concurrent writers and tolerate brief disagreement between regions.\n\nThe boundary is invariants that depend on the global state. A bank balance that must never go negative cannot be enforced by independent local decisions: two regions could each approve a withdrawal that is valid locally, and together overdraw the account. Enforcing that rule requires coordination, such as a single owner or a synchronous consensus step, which reintroduces the cross-region latency CRDTs were meant to avoid. So CRDTs are a tool for the right data, not a universal answer to multi-region consistency.",
+    "quiz": {
+      "q": "Why can't a rule like “balance must not go below zero” be handled by a CRDT?",
+      "a": "It is a global invariant: regions deciding independently could each approve valid-looking withdrawals that together overdraw, so enforcing it needs coordination."
+    }
+  },
+  {
+    "id": "ch08-057",
+    "chapter": 8,
+    "section": "8.9 Going global: multi-region storage",
+    "title": "Home regions: avoid conflicts by giving each item one writer",
+    "body": "The simplest way to handle conflicts is to avoid them by design. Give each item a home region that owns all writes to it, a single writer per key, and replicate asynchronously to other regions for reads. Because only one region ever accepts writes for a given item, two regions can never update it concurrently, so there is nothing to resolve. This is very common for user data: your profile is written in your home region and read from replicas elsewhere.",
+    "deeper": "Home regions trade some write latency for simplicity. A user who travels far from their home region pays a cross-region round trip on writes, since those writes must go home. Reads remain fast everywhere because asynchronous replicas serve them locally, though they may be slightly stale.\n\nFor most user data this is an excellent trade. Users mostly stay near their home, their data is mostly written by themselves, and slightly stale reads by others are acceptable. The design needs a router that knows each user's home region; the chapter's residency diagram shows exactly that: an EU user's profile write goes to a router that reads the user's home region and sends the write to the EU leader region.\n\nHome regions combine naturally with other ideas in the section. Akkio shows the home can move when a user relocates, keeping writes local. Data residency rules can be enforced by choosing the home region according to jurisdiction. And because writes are ordered in one place, the application gets predictable semantics without the clock-skew risk of LWW or the merge complexity of vector clocks.",
+    "quiz": {
+      "q": "How does a home region per item avoid write conflicts?",
+      "a": "Only the home region accepts writes for that item, so there is a single writer per key and concurrent cross-region updates never happen; other regions get async read replicas."
+    }
+  },
+  {
+    "id": "ch08-058",
+    "chapter": 8,
+    "section": "8.9 Going global: multi-region storage",
+    "title": "Data residency is a placement constraint, not a policy doc",
+    "body": "Data residency laws, such as rules in the EU, India, or China, may require certain data to be stored or processed inside a country or region. In a storage system this becomes a hard placement constraint. The shard manager or placement layer must know each shard's jurisdiction and refuse illegal placements. Backups, logs, caches, and analytics copies are also copies and must follow the same rule. Failover targets must be inside the allowed area, which is why Spanner's dual-region configurations keep all replicas within one country.",
+    "deeper": "The chapter's diagram traces an EU user's profile write under a placement policy of residency = EU. The router reads the user's home region and sends the write to the EU leader region. From there, a synchronous quorum replicates inside EU zones, backups are stored in the EU only, and a US read replica receives an asynchronous stream containing allowed fields only. That last detail shows residency can be field-level: some parts of a record may leave the region while personal data does not.\n\nMaking residency a placement constraint means encoding it where placement decisions are made. Shard managers like Meta's already let applications declare constraints such as keep a shard near its users; jurisdiction is another constraint of the same kind, but one that must never be violated for load or cost reasons.\n\nFailover is the easy thing to forget. A disaster recovery plan that fails EU data over to a US region breaks the law at exactly the moment everyone is busy. Spanner's dual-region configurations exist so that a customer can tolerate the loss of a region without data leaving the country.",
+    "quiz": {
+      "q": "Why must data residency be enforced in the placement layer rather than only in policy?",
+      "a": "Placement decides where every copy and failover target lives; only there can illegal placements be refused automatically, including backups, logs, caches, and analytics copies."
+    }
+  },
+  {
+    "id": "ch08-059",
+    "chapter": 8,
+    "section": "8.9 Going global: multi-region storage",
+    "title": "Common mistake: residency enforced only in the primary database",
+    "body": "A common mistake is enforcing data residency only in the primary database. The main tables stay in the EU, but a debug log, an analytics export, or a cross-region backup quietly copies personal data abroad. Every one of those is a copy, and the law applies to copies. Residency must be treated as a property of the data itself, carried along with it and enforced on every copy path, not as a setting on one database.",
+    "deeper": "Copies multiply in a large system. Application logs capture request payloads. Analytics pipelines export tables to a central warehouse, often in one region. Caches sit in edge locations worldwide. Backups are often sent to a distant region for disaster recovery. Cross-region read replicas serve users elsewhere. Failover replicas are prepared in case of regional outage. Each of these paths can move EU personal data out of the EU without anyone touching the primary database.\n\nThe chapter's check-your-understanding answer lists backups, logs, caches, analytics exports, failover replicas, and cross-region read replicas as copy paths that must follow the rule.\n\nTreating residency as a property of the data means tagging data with its jurisdiction and having every pipeline, backup job, cache, and replication stream respect that tag. The diagram in the residency section shows one piece of this: the asynchronous stream to a US read replica carries allowed fields only, and backups are stored in the EU only. Audits should trace every path data can take, not just where the primary copy sits.",
+    "quiz": {
+      "q": "Your EU user data must stay in the EU. Name three copy paths besides the primary database that must follow the rule.",
+      "a": "Any three of: backups, logs, caches, analytics exports, failover replicas, and cross-region read replicas."
+    }
+  },
+  {
+    "id": "ch08-060",
+    "chapter": 8,
+    "section": "8.10 Capacity planning at hyperscale",
+    "title": "Capacity planning: buy it months before you need it",
+    "body": "Capacity planning means predicting how much storage, IOPS, network, and power you will need, and buying it before you need it. It is hard for two reasons. Lead times are long: servers must be purchased, shipped, racked, and burned in, and new datacenter space needs power and cooling built. In general industry experience, server lead times are months and new buildings take years. And demand is lumpy: a product launch or a new ML dataset can add petabytes in weeks, while data rarely shrinks.",
+    "deeper": "The combination is what makes planning risky. If demand were smooth and hardware could be delivered in days, you could simply buy as you go. Instead, you must commit money months or years ahead based on a forecast, and the forecast can be wrong in either direction. Underbuy and you run out of room; overbuy and expensive hardware sits idle.\n\nThe chapter notes that exact lead times are rarely published, so it speaks in general terms: months for servers, years for buildings. Burn-in, running new hardware under load before trusting it with data, adds time even after the machines arrive.\n\nLumpiness makes forecasting harder than a simple trend line. A single new ML training dataset or a feature launch that stores video can add petabytes quickly. And because data rarely shrinks, every spike becomes a permanent step up in the baseline. Planning must account for both the steady trend and the likelihood of sudden jumps, which is why the basic model includes a safety buffer for forecast error on top of expected growth.",
+    "quiz": {
+      "q": "What two factors make storage capacity planning hard at hyperscale?",
+      "a": "Long lead times (months for servers, years for buildings) and lumpy demand, where launches or new datasets add petabytes in weeks and data rarely shrinks."
+    }
+  },
+  {
+    "id": "ch08-061",
+    "chapter": 8,
+    "section": "8.10 Capacity planning at hyperscale",
+    "title": "100 PB growing 3 percent a month needs 149 PB in 6 months",
+    "body": "The chapter's teaching model, with all numbers assumed: current usage is 100 PB, growth is 3 percent per month, and hardware lead time is 6 months. In 6 months, usage will be about 100 x 1.03^6, roughly 119 PB. With a target maximum fill of 80 percent, you need about 119 / 0.8, roughly 149 PB of raw usable capacity installed by then. On top of that, add a safety buffer for forecast error, such as another month or two of growth.",
+    "deeper": "Each step in the model represents a real planning concern. Compounding growth over the lead time answers how much data you will have when the hardware you order today finally arrives. Growth compounds, so 3 percent per month over 6 months is about 19 percent, not 18.\n\nDividing by the target fill converts expected usage into required capacity. The 80 percent target reserves free space for repair, rebalancing, and bursts, as the next card explains. Without that division you would plan to be 100 percent full, which in distributed storage is dangerous.\n\nThe safety buffer handles the lumpy demand problem. Forecasts are wrong, and the cost of being short is much higher than the cost of a little extra hardware, so planners add another month or two of growth.\n\nNotice what the model outputs: a target for installed capacity at a future date. Combined with the lead time, that tells you when to place the order. The senior staff lens later turns this into a policy question about which fill levels trigger an order and which trigger an incident.",
+    "quiz": {
+      "q": "In the basic capacity model, why divide projected usage by 0.8?",
+      "a": "The target maximum fill is 80 percent, leaving free space for repair, rebalancing, and bursts, so installed capacity must be projected usage divided by 0.8."
+    }
+  },
+  {
+    "id": "ch08-062",
+    "chapter": 8,
+    "section": "8.10 Capacity planning at hyperscale",
+    "title": "Never run distributed storage full: repair needs room",
+    "body": "Distributed storage must never run full. When a disk or rack fails, its data must be re-created somewhere else from the remaining replicas or erasure-coded fragments, and that requires free space on other machines. If the cluster is 95 percent full, there may be no room to repair, and an ordinary hardware failure turns into real data risk, because the lost redundancy cannot be restored. That is why capacity models target a maximum fill such as 80 percent. Meta's Tectonic representative cluster was about 70 percent full in its 2021 snapshot.",
+    "deeper": "Free space is part of the durability design, not waste. Replication and erasure coding protect data only if lost copies are quickly rebuilt. A full cluster breaks that loop: after a failure, data sits with reduced redundancy, and a second failure during that window can cause loss.\n\nFree space also serves the other background processes the chapter describes. Rebalancing needs room on destination servers to receive shards. Continuous add-and-retire needs room to drain racks before powering them off, since every chunk from the retiring rack must land elsewhere with full redundancy. Bursts of new data need room too.\n\nThe Tectonic figures show a real operator following this rule: 1,250 PB used out of 1,590 PB capacity is about 70 percent. The chapter's key takeaway puts it bluntly: never run storage near full, and plan capacity with lead time, growth, buffer, and repair headroom. The senior staff lens that follows turns this into an operational policy, distinguishing the fill level that triggers a hardware order from the fill level that triggers an incident.",
+    "quiz": {
+      "q": "Why is a 95 percent full distributed storage cluster dangerous even if nothing has failed yet?",
+      "a": "When a disk or rack fails, its data must be rebuilt elsewhere; with little free space there may be no room to restore redundancy, so a routine failure becomes data risk."
+    }
+  },
+  {
+    "id": "ch08-063",
+    "chapter": 8,
+    "section": "8.10 Capacity planning at hyperscale",
+    "title": "No big-bang upgrades: racks arrive and leave every week",
+    "body": "Big storage fleets never upgrade in one step. Every week new racks arrive and old racks retire. This works only under three conditions. The placement layer must support heterogeneous hardware, such as disks of different sizes weighted by capacity, as CRUSH weights do. New capacity must be filled gradually through rate-limited rebalancing. And old capacity must be drained before removal: mark the rack as draining, move its data out, verify every chunk has full redundancy elsewhere, then power off.",
+    "deeper": "Heterogeneity is unavoidable in a fleet that adds and removes hardware continuously. At any moment, several generations of disks and servers coexist, with different capacities and performance. A placement system that assumes identical machines would overfill small disks and underuse big ones. Weighting, as in CRUSH's cluster map or vnode counts in consistent hashing, lets each device receive a share proportional to its capacity.\n\nGradual filling is the lesson from the rebalancing common mistake: an empty new rack attracts a flood of data from a naive balancer, which can saturate the network for hours. Rate limits keep that migration in the background.\n\nDraining is the safety-critical step. Simply unplugging an old rack would remove copies and reduce redundancy for every chunk it held, effectively simulating a large failure. Instead, the rack is marked draining so no new data lands there, its data is copied out, and the system verifies that every chunk has full redundancy elsewhere before anyone powers it off. Chapter 9 covers the operational side of decommissioning.",
+    "quiz": {
+      "q": "Why must a retiring rack be drained and verified before it is powered off?",
+      "a": "Powering it off directly removes copies and reduces redundancy like a failure would; draining moves data out and confirms every chunk is fully redundant elsewhere first."
+    }
+  },
+  {
+    "id": "ch08-064",
+    "chapter": 8,
+    "section": "8.10 Capacity planning at hyperscale",
+    "title": "Senior staff lens: the gap between order and incident",
+    "body": "Capacity planning is where storage engineering meets finance. A useful review question is: what fill level triggers a hardware order, and what fill level triggers an incident? The gap between those two levels must be larger than the hardware lead time multiplied by the worst realistic growth rate. If it is smaller, then by the time an order is placed, demand can reach the incident level before the new hardware arrives, and the team will be in crisis with nothing to deploy.",
+    "deeper": "This question turns the capacity model into an operational policy. The order threshold is when the team commits money. The incident threshold is the fill level at which repair headroom is at risk, and people should be paged. Between them lies the runway.\n\nThe runway must cover lead time multiplied by the worst realistic growth rate, not the average. For example, in the chapter's model, 6 months of lead time at 3 percent monthly growth adds about 19 percent more data. If growth could plausibly jump because of a launch or a new ML dataset, the gap must cover that faster rate. Otherwise a lumpy month consumes the runway before the new racks are racked and burned in.\n\nThe finance connection is that a wider gap means buying earlier and carrying more idle hardware, which costs money, while a narrower gap saves money but risks running out. Making the trade-off explicit, with both thresholds written down and tied to lead time and growth, lets engineering and finance agree on the risk they are taking instead of discovering it during an outage.",
+    "quiz": {
+      "q": "How large must the gap be between the fill level that triggers an order and the one that triggers an incident?",
+      "a": "Larger than hardware lead time multiplied by the worst realistic growth rate, so demand cannot hit the incident level before new capacity arrives."
+    }
+  },
+  {
+    "id": "ch08-065",
+    "chapter": 8,
+    "section": "8.11 Tail latency at scale",
+    "title": "Fan out to 100 servers and 63 percent of requests are slow",
+    "body": "When one user request touches many servers, the slowest server decides the latency. Jeff Dean and Luiz Barroso's The Tail at Scale (CACM 2013) gives the classic example. Suppose a server usually answers in 10 ms, but 1 request in 100 takes 1 second. If a user request touches one server, 1 in 100 is slow. If it must wait for 100 such servers in parallel, the chance all 100 are fast is 0.99^100, about 0.37. So about 63 percent of user requests take over a second.",
+    "deeper": "The math is the probability of avoiding every slow response. Each server independently has a 99 percent chance of being fast, so for N servers the chance all are fast is 0.99 to the power N. At 100 servers that is about 37 percent, meaning a rare per-server event becomes the common case for the user. The chapter's quiz applies the same formula to 50 servers: 1 minus 0.99^50 is about 0.39, so about 39 percent of requests are slow.\n\nThe tail has several sources in storage systems. Background work such as compaction, scrubbing, and rebalancing temporarily slows servers. Noisy neighbors in multi-tenant clusters consume shared resources. Queueing adds delay when requests arrive in bursts. Slowly failing hardware, such as a disk that still works but responds slowly, can drag down every request that touches it.\n\nFan-out is common in the chapter's designs: hash-partitioned range queries scatter to every shard, salted counters read N sub-keys, and erasure-coded reads fetch many fragments. Each of these multiplies exposure to the tail, which is why tail latency techniques matter at scale.",
+    "quiz": {
+      "q": "A request fans out to 50 servers, each 1 percent likely to be slow. Roughly what fraction of requests are slow?",
+      "a": "1 minus 0.99^50, about 0.39, so roughly 39 percent. Try hedged requests after a p95 delay first, and look for the root cause of the slow tail."
+    }
+  },
+  {
+    "id": "ch08-066",
+    "chapter": 8,
+    "section": "8.11 Tail latency at scale",
+    "title": "Hedged requests: 1,800 ms to 74 ms for 2 percent more load",
+    "body": "A hedged request sends a request to one replica, and if no reply arrives after a short delay, for example the 95th percentile latency, sends a second copy to another replica and uses whichever answers first. Most requests finish before the hedge fires, so extra load stays small. In a Google benchmark reading 1,000 keys from Bigtable across 100 servers, hedging after 10 ms cut 99.9th percentile latency from 1,800 ms to 74 ms, while sending only 2 percent more requests.",
+    "deeper": "The chapter's sequence diagram shows the flow. The client sends GET key to Replica A and waits about 10 ms, the p95 delay. No answer has arrived, so it sends a hedge GET key to Replica B. Replica B returns the value quickly, and the client cancels the outstanding request to Replica A.\n\nThe delay is what makes hedging cheap. By waiting until the 95th percentile, the client hedges only the roughly 5 percent of requests that are already slow, and many of those are stuck behind a temporary problem on one replica, such as compaction or a noisy neighbor. A second replica is unlikely to be slow at the same moment, so the hedge usually wins.\n\nThe benchmark numbers illustrate the leverage: a dramatic cut in extreme tail latency, from 1,800 ms to 74 ms at the 99.9th percentile, for only 2 percent extra requests. The chapter's quiz answer recommends hedged requests after a p95 delay as the first technique to try for a fan-out tail problem, while also investigating the root cause of the slow tail.",
+    "quiz": {
+      "q": "Why wait until about the 95th percentile before sending a hedged request?",
+      "a": "Most requests finish by then, so only the slow few get duplicated; the hedge rescues stragglers while adding only a few percent extra load."
+    }
+  },
+  {
+    "id": "ch08-067",
+    "chapter": 8,
+    "section": "8.11 Tail latency at scale",
+    "title": "Tied requests: two queues, one cancels the other",
+    "body": "A tied request sends the same request to two servers at once, and each copy knows about the other. When one server actually starts executing the request, it tells the other server to cancel its copy. The goal is to avoid waiting in a long queue: whichever server reaches the request first does the work, and the other drops it before spending effort. This attacks tail latency caused by queueing, where a request's delay comes from waiting behind others rather than from its own processing time.",
+    "deeper": "Tied requests address a weakness of hedging. A hedge waits for a delay before sending the second copy, so a request stuck in a long queue still loses that waiting time. A tied request enqueues on both servers immediately, so it gets the shorter of the two queue waits without any delay.\n\nThe cancellation message is what keeps the cost down. Without it, sending every request to two servers would double the load, which is exactly the problem the chapter warns about with immediate hedging. Because the servers coordinate, only one of them performs the actual work in the common case; the other copy is removed from its queue once execution starts elsewhere. There is a small window in which both might start at nearly the same moment, but the extra work is limited.\n\nQueueing is a major source of tail latency in storage systems, since requests arrive in bursts and background work can occupy a server. Tied requests let the client benefit from whichever server happens to be less busy at that moment, without predicting it in advance.",
+    "quiz": {
+      "q": "How do tied requests avoid doubling server load despite sending every request twice?",
+      "a": "Each copy knows about the other; when one server starts executing, it tells the other to cancel, so usually only one server does the work."
+    }
+  },
+  {
+    "id": "ch08-068",
+    "chapter": 8,
+    "section": "8.11 Tail latency at scale",
+    "title": "Ask for 12 fragments, decode from the first 10",
+    "body": "Two more tail-latency techniques fit storage well. Erasure-code read slack: with a Reed-Solomon RS(10,4) stripe, any 10 of the 14 fragments can rebuild the data, so a reader can request 11 or 12 fragments and decode from the first 10 that arrive, simply ignoring slow disks. Separating background work: schedule compaction, repair, and similar maintenance at lower priority than user requests, as Tectonic's TrafficClasses do, so it does not create the slow responses in the first place.",
+    "deeper": "Read slack takes advantage of redundancy that already exists for durability. A plain RS(10,4) read would fetch exactly 10 fragments and be as slow as the slowest of those 10 disks, a fan-out of 10 with full exposure to the tail. Requesting one or two extra fragments means the read completes when the 10 fastest responses arrive, and a disk that is busy, compacting, or failing slowly is skipped automatically. The cost is modestly more read traffic.\n\nSeparating background work tackles a root cause. The chapter lists background work such as compaction, scrubbing, and rebalancing as a named source of the tail. Running it at the same priority as user traffic guarantees that user requests sometimes queue behind it. Tectonic's Bronze class for background work, with lower-class requests yielding to Gold requests, keeps maintenance from pushing up latency-sensitive traffic.\n\nTogether with hedged and tied requests, these form the chapter's toolkit. The key takeaway sums it up: at high fan-out, the tail decides latency, and hedged and tied requests cut tail latency with small extra load.",
+    "quiz": {
+      "q": "How does requesting 11 or 12 fragments of an RS(10,4) stripe reduce tail latency?",
+      "a": "Any 10 fragments can decode the data, so the reader uses the first 10 to arrive and ignores slow disks instead of waiting for the slowest of exactly 10."
+    }
+  },
+  {
+    "id": "ch08-069",
+    "chapter": 8,
+    "section": "8.11 Tail latency at scale",
+    "title": "Common mistake: hedging immediately",
+    "body": "A common mistake is hedging immediately, sending the duplicate request at the same time as the original. That doubles the load on the storage system, and higher load means longer queues, which makes the tail latency you were trying to fix even worse. The correct approach is to hedge only after a delay near the 95th percentile latency, so only the slow few requests get a second copy, and to cap the hedge rate so hedges cannot flood the system during a broad slowdown.",
+    "deeper": "Hedging works because slow responses are usually caused by temporary, local problems on one replica. Waiting until the 95th percentile means you duplicate only the requests that are genuinely stuck, which is why the Google Bigtable benchmark saw only 2 percent more requests while cutting 99.9th percentile latency from 1,800 ms to 74 ms.\n\nImmediate hedging throws that away. Every request now costs two server operations, so the system needs twice the capacity to stay at the same utilization. If it does not have that capacity, queues grow, every server slows down, and the tail gets longer for everyone, the opposite of the intended effect.\n\nThe hedge-rate cap protects against a different failure. If the whole cluster slows down, for example during a large rebalance or a partial outage, many requests exceed the p95 delay at once and hedging would fire for all of them, adding load exactly when the system is weakest. A cap limits hedges to a small fraction of traffic so the mechanism cannot amplify an incident. Tied requests are the alternative when queueing is the main problem.",
+    "quiz": {
+      "q": "Why is sending a hedge request immediately worse than waiting for a p95 delay?",
+      "a": "Immediate hedging doubles load, lengthening queues and worsening the tail; a p95 delay duplicates only the slow few, and a rate cap prevents hedge floods."
+    }
+  },
+  {
+    "id": "ch08-070",
+    "chapter": 8,
+    "section": "Key takeaways",
+    "title": "Chapter 8 in ten lines: split, place, stay fast",
+    "body": "Scale has six dimensions: bytes, IOPS, metadata operations, object count, tenants, and regions, and each breaks a different component. Range partitioning keeps scans cheap but hot-spots on sequential keys; hashing spreads load but loses scans; consistent hashing with vnodes moves only about 1/N of data. Big companies converged on central shard managers. Placement spreads copies across failure domains. Multi-tenancy needs quotas plus priority classes. Multi-region design trades write latency against data loss. Never run storage near full. At high fan-out, the tail decides latency.",
+    "deeper": "The chapter's key takeaways fill in the rest. Slicer, Shard Manager, and Helix won out because operators need to place shards by load, fault domain, hardware, and region, and to drain servers before planned events. CRUSH computes placement from a cluster map and rules, while directory placement is more flexible and can be heat-aware. At huge scale, spreading each tenant over very many drives makes bursts cancel out, as in S3's heat management; small systems need explicit headroom instead.\n\nDynamoDB's evolution shows that per-partition limits cause throttling under skew; table-level admission control plus split-for-consumption fixes most skew, but not a single hot key, which needs caching, replicas, coalescing, or salting. Tectonic's Gold, Silver, and Bronze TrafficClasses show how guaranteed quotas and priority scheduling share ephemeral resources like IOPS. For multi-region, leader placement, home regions, LWW, CRDTs, and residency constraints are the main tools, and residency must follow every copy. Capacity plans must combine lead time, growth, buffer, and repair headroom. Hedged and tied requests cut tail latency with small extra load.",
+    "quiz": {
+      "q": "Why did large companies converge on central, directory-style shard managers?",
+      "a": "They need to place shards by load, fault domain, hardware, and region, and to drain servers gracefully before planned events, which hash-based placement cannot express."
+    }
+  }
+]

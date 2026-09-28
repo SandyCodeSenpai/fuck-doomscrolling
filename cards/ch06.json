@@ -1,0 +1,926 @@
+[
+  {
+    "id": "ch06-001",
+    "chapter": 6,
+    "section": "Caching Tiers: Keeping Hot Data in Memory",
+    "title": "One home screen, dozens of reads: why every giant adds caches",
+    "body": "Picture a global app with 1 billion users. A single home-screen load might read a profile, 50 friend names, 20 post counters and some settings. Multiply that by hundreds of millions of daily users and the database would face an enormous read rate. Durable stores are slow and expensive per read compared to memory, so almost every large company answers the same way: put caches in front of storage. Caches keep hot data in memory so most reads never reach the database at all.",
+    "deeper": "This chapter follows a clear arc. First it explains why caches exist and the four classic patterns for wiring them up. Then it tackles the hard part: keeping the cache correct when the source of truth changes, which is where most caching bugs live. Next come the special problems that only appear at scale: thundering herds (thousands of simultaneous misses), hot keys (one key getting a huge share of traffic), and cold caches (an empty cache suddenly facing full load). The middle of the chapter walks through real systems: Meta's memcache deployment and its CacheLib library, Netflix's EVCache, Twitter/X's Twemcache and Pelikan, and Uber's CacheFront. It then covers Redis and Valkey, flash-backed caches, and the CDN as the outermost cache layer. It ends with sizing and hit-ratio math and a catalogue of failure modes. The running example (1 billion users, a heavy home screen) returns in the sizing section to show how small changes in hit ratio translate into large changes in database load.",
+    "quiz": {
+      "q": "Why is putting a cache in front of storage the near-universal answer to read-heavy apps?",
+      "a": "Memory reads are far faster and cheaper per read than durable storage, so serving repeated reads from memory spares the database an otherwise enormous read rate."
+    }
+  },
+  {
+    "id": "ch06-002",
+    "chapter": 6,
+    "section": "6.1 Why caches exist",
+    "title": "A cache is a copy you are allowed to lose",
+    "body": "A cache is a fast, smaller copy of data whose real home, the source of truth, lives somewhere slower. The defining property: a cache can lose data and the system is still correct, because anything missing can be read again from the source. That one fact shapes every design choice in caching. The price is real though: another system to operate, extra memory, and above all stale data, because the source of truth and the cache can disagree. Most caching bugs live in that gap.",
+    "deeper": "Because the cache is disposable, you can make aggressive choices you would never make for a database. You can drop requests under load and treat them as misses, restart nodes freely, evict data whenever memory runs short, and keep only one copy of an item. Meta, for example, sends gets over UDP and simply treats dropped packets as misses. None of that would be acceptable for data of record.\n\nThe flip side is that disposability only covers correctness, not capacity. An empty cache still gives correct answers, but the database may not survive serving all of them, which is why later sections treat big caches as load-bearing. And the disagreement between cache and source is the core engineering problem: every write to the source of truth creates a window in which the cache may hold an old value. The chapter's invalidation section, with its stale-set, replication-lag and lost-invalidation races, is entirely about shrinking and bounding that window. When you evaluate any caching design, ask two separate questions: what happens to correctness if the cache is lost, and what happens to load.",
+    "quiz": {
+      "q": "Why can a cache drop data without making the system incorrect, and what problem does that not solve?",
+      "a": "The source of truth still has the data, so misses just re-read it. It does not solve staleness (cache and source disagreeing) or the load spike when the cache is empty."
+    }
+  },
+  {
+    "id": "ch06-003",
+    "chapter": 6,
+    "section": "6.1 Why caches exist",
+    "title": "Latency and offload: a cache server can replace tens of DBs",
+    "body": "Caches deliver latency and offload. Reading from memory on a nearby server takes well under a millisecond, while a database read that touches disk and replicas can take several milliseconds, and much more at the tail. Offload means every cache hit is a request the database never serves. Meta's CacheLib paper (2020) notes that a single caching server can replace tens of backend database servers, thanks to about 20 times higher throughput and hit ratios above 80 percent.",
+    "deeper": "The two benefits multiply. Higher throughput per server means one cache box handles what many database boxes would; a high hit ratio means only a small fraction of requests fall through. With 20 times the throughput and more than 80 percent of reads absorbed, the database fleet needed for the remaining misses shrinks dramatically.\n\nThe tail point matters for user-facing pages. A page load at Meta can fetch hundreds of keys, so overall page latency is set by the slowest of many reads. A database read that is usually a few milliseconds but occasionally much slower will regularly show up in some page's critical path. Serving most of those reads from memory in well under a millisecond compresses the tail as well as the median. Uber's CacheFront results illustrate this: after adding an integrated Redis cache it reported p75 latency down 75 percent and p99.9 latency down more than 67 percent (2024).\n\nThe catch, developed later in the chapter, is that offload becomes a dependency: if the database fleet is sized for only the miss traffic, losing the cache means losing the service.",
+    "quiz": {
+      "q": "Why do caches help tail latency and not just average latency?",
+      "a": "Pages fan out to many reads and wait for the slowest. Memory reads are consistently sub-millisecond, while database reads can spike at the tail, so caching removes most slow reads from the critical path."
+    }
+  },
+  {
+    "id": "ch06-004",
+    "chapter": 6,
+    "section": "6.1 Why caches exist",
+    "title": "Uber: 3,000 Redis cores instead of 60,000 database cores",
+    "body": "Caches also save money. Serving a read from memory needs far less CPU than a database read, which must parse SQL, take locks and read B-tree pages. The chapter's standout example: Uber reported one use case serving 6 million reads per second with about 3,000 Redis cores, instead of an estimated 60,000 database cores (2024). That is roughly a twentyfold reduction in compute for the same read traffic, simply by answering repeated reads from a key-value lookup in memory.",
+    "deeper": "The CPU gap comes from how much work each path does. A database read goes through query parsing and planning, concurrency control (locks or equivalent), and page-oriented storage structures like B-trees, possibly with disk I/O. A cache read is essentially a hash lookup on a key and a memory copy of the value. Even when the database has the data in its own buffer pool, it still pays the parsing and locking overhead on every request.\n\nThe Uber number comes from CacheFront, its cache integrated into the Docstore query engine, which overall serves over 40 million reads per second. The comparison is an estimate for one use case, but it shows why caching is often a cost decision rather than only a latency decision: at millions of reads per second, the database cores you avoid buying dominate the cost of running the cache fleet.\n\nThe costs on the other side of the ledger are an extra system to operate, extra memory, and the correctness risk of stale data. Those costs are why the rest of the chapter focuses on invalidation and failure handling.",
+    "quiz": {
+      "q": "Why does a cache hit need so much less CPU than a database read, even if the database has the row in memory?",
+      "a": "The database still parses SQL, takes locks and walks B-tree pages per request; a cache does a key lookup and returns bytes."
+    }
+  },
+  {
+    "id": "ch06-005",
+    "chapter": 6,
+    "section": "6.1 Why caches exist",
+    "title": "Senior lens: could the database survive if the cache were empty?",
+    "body": "A cache starts as a performance tool and quietly becomes a capacity dependency. Once the database is sized only for the traffic that misses the cache, losing the cache means losing the database. The senior staff question for every design review: if this cache were empty right now, could the database survive the load? If the answer is no, the cache is load-bearing, and its failure and warmup paths must be designed as carefully as the database itself.",
+    "deeper": "Caches drift into this state gradually. A team adds a cache to cut latency, the hit ratio climbs, the database looks underused, and someone right-sizes the database fleet to save money. Now the database can only handle the miss traffic. The sizing section makes the math concrete: with 2 million reads per second and a database limit of 100,000, a hit ratio of 95 percent already puts the database at its limit, and anything lower is an outage.\n\nDesigning the failure path means planning for mass restarts, deploys, node failures and regional failover. The chapter shows how big companies do this: Meta's Gutter pool absorbs failed servers' traffic and Cold Cluster Warmup fills new clusters from warm peers, CacheLib offers warm restarts, Netflix EVCache and Uber CacheFront replicate caches across regions so failover lands on warm caches. The DynamoDB paper takes a different angle, deliberately sending constant refresh traffic to its metadata fleet so it never depends on a hit ratio. Alternatives include admission control and load shedding in front of the database.",
+    "quiz": {
+      "q": "What makes a cache 'load-bearing', and what must you then design carefully?",
+      "a": "The database cannot survive the full read load if the cache is empty. You must design the cache's failure, restart and warmup paths as carefully as the database."
+    }
+  },
+  {
+    "id": "ch06-006",
+    "chapter": 6,
+    "section": "6.2 Cache patterns",
+    "title": "Look-aside caching: the app checks, misses, fills, and deletes",
+    "body": "In look-aside (cache-aside) caching, the application owns all the logic. On a read it checks the cache; on a miss it reads the database and puts the value into the cache. On a write it writes the database, then deletes the cache entry rather than updating it. The next reader refills it. Meta calls its memcache usage a demand-filled look-aside cache. This is the dominant pattern at big-tech scale and the model behind most web caches.",
+    "deeper": "Walk through a concrete flow. The app calls get(user:42) on the cache and gets a miss. It runs SELECT for profile 42 against the database, receives the row, and calls set(user:42, row). Later a write happens: the app runs UPDATE profile 42 against the database, gets ok, and then calls delete(user:42). The cache is now empty for that key until the next reader fills it.\n\nThe strengths: the database remains the source of truth, so there is no data-loss risk if the cache dies, and the cache only holds data that someone actually read. The weaknesses: every service must implement the logic correctly, and the gap between reading the database and filling the cache opens races. A reader can fill an old value after a writer's delete (the stale set), or fill from a lagging replica. So look-aside with delete-on-write is only eventually consistent. The chapter's fixes, including leases, versioned values, commit-log invalidation and TTLs, all exist to patch those races. Uber's CacheFront moves this same logic into the database query engine so teams cannot forget the delete.",
+    "quiz": {
+      "q": "In look-aside caching, who fills the cache, and what does a write do to the cache?",
+      "a": "The application fills it after a miss by reading the database. A write goes to the database first, then the application deletes the cache key."
+    }
+  },
+  {
+    "id": "ch06-007",
+    "chapter": 6,
+    "section": "6.2 Cache patterns",
+    "title": "Why delete on write instead of updating the cache",
+    "body": "On a write, look-aside caches delete the cached entry instead of writing the new value into it. Two reasons. First, deletes are idempotent: doing one twice is harmless. Second, updating invites a race where two writers update the cache in the opposite order from the database, leaving the cache permanently holding the older value. With delete, there is nothing to reorder: the entry is simply gone, and the next reader refills it with whatever the database currently holds.",
+    "deeper": "Consider two writers, A and B, changing the same row. A writes value 1 to the database, then B writes value 2, so the database ends at 2. If each writer then sets its own value into the cache, network or scheduling delays can deliver B's set first and A's set second. The cache now says 1 while the database says 2, and nothing will correct it until the entry expires or is written again.\n\nWith delete-on-write, both writers send delete. Order does not matter, and a duplicated or retried delete does no harm, which also makes deletes easy to retry and to broadcast from a log. The next reader misses and reads 2 from the database.\n\nDeleting does not remove every race: a slow reader can still fill an old value after the delete, the stale-set problem that Meta's leases fix. And it has a cost: every write causes at least one future miss. For most read-heavy workloads that is a good trade, which is why the chapter lists it as a key takeaway: look-aside with delete-on-write is the dominant pattern at scale.",
+    "quiz": {
+      "q": "Why does Meta delete cache entries on write instead of updating them?",
+      "a": "Deletes are idempotent and avoid races where concurrent updates reach the cache in a different order than the database. The next reader refills with the current value."
+    }
+  },
+  {
+    "id": "ch06-008",
+    "chapter": 6,
+    "section": "6.2 Cache patterns",
+    "title": "Read-through: let the cache talk to the database",
+    "body": "In a read-through cache, the cache itself loads from the database on a miss. The application only ever talks to the cache, never directly to the database for reads. This centralizes the miss-handling logic in one place instead of scattering it across every service, but it means the cache must know how to query the database. Staleness and data-loss characteristics are the same as look-aside. Uber's CacheFront is an example of this kind of integrated cache.",
+    "deeper": "The trade-off between look-aside and read-through is about where logic lives. In look-aside, each application team writes the check, miss, read, fill sequence and the delete on write, and each team can get it subtly wrong. In read-through, one component owns that logic, which makes it easier to add protections once for everyone: stale-fill guards, negative caching, invalidation from a log.\n\nThe cost is coupling. A generic key-value cache like memcached knows nothing about SQL schemas; to be read-through it needs to understand how a key maps to a query. That is why read-through tends to show up as a feature of a database platform rather than a standalone cache. Uber's CacheFront sits inside Docstore's query engine: the engine checks Redis, returns cached rows, fetches the rest from storage and fills Redis asynchronously. The chapter's comparison table rates read-through the same as look-aside for write cost (database write plus delete), staleness risk and data-loss risk (none, since the database is still truth).",
+    "quiz": {
+      "q": "What does read-through gain over look-aside, and what does it cost?",
+      "a": "Miss handling lives in one place so apps only talk to the cache, but the cache must know how to query the database, coupling it to the data model."
+    }
+  },
+  {
+    "id": "ch06-009",
+    "chapter": 6,
+    "section": "6.2 Cache patterns",
+    "title": "Write-through: always fresh, but every write pays twice",
+    "body": "In write-through caching, writes go to the cache, and the cache synchronously writes to the database before acknowledging. The cache is therefore always fresh for keys that were written, and nothing is lost if the cache fails because the database already has the write. The downsides: every write pays both latencies, the cache and the database, and you end up caching data that may never be read. It suits small, hot data like configuration and sessions.",
+    "deeper": "Write-through fixes one specific staleness problem: after a write, readers of that key see the new value immediately from the cache, with no window where an old value lingers. The chapter's comparison table marks its staleness risk as low for written keys and its data-loss risk as none.\n\nBut it has two costs that make it a poor default at scale. First, write latency is the sum of the cache write and the database write, since the acknowledgment waits for both. Second, every written key lands in cache memory whether or not anyone will read it, which wastes memory on write-heavy, read-rarely data and can evict hot keys. Keys that were never written through (for example, rows changed by some other path) can still be stale.\n\nThat is why the typical use is small, hot data: configuration values read constantly and written rarely, and user sessions. For large datasets with many writes, look-aside with delete-on-write avoids paying for caching unread data.",
+    "quiz": {
+      "q": "Why is write-through a poor fit for large write-heavy datasets?",
+      "a": "Every write pays cache plus database latency, and every written key occupies cache memory even if never read, wasting memory and possibly evicting hot data."
+    }
+  },
+  {
+    "id": "ch06-010",
+    "chapter": 6,
+    "section": "6.2 Cache patterns",
+    "title": "Write-back: fastest writes, but a dead node loses data",
+    "body": "In write-back (write-behind) caching, writes go to the cache and are acknowledged immediately. The cache writes to the database later, in batches. This gives the fastest writes of any pattern, but if the cache node dies before flushing, those writes are lost. At big-tech scale, write-back is used for counters and metrics that can tolerate a small loss, never for user data of record, because the cache briefly becomes the only holder of the data.",
+    "deeper": "Write-back breaks the rule that makes caches safe: normally a cache can lose anything because the source of truth has it. Between acknowledgment and flush, the cache is the source of truth, so a crash, a restart or an eviction bug destroys acknowledged writes.\n\nThe benefit is throughput. Batching lets many increments to the same counter collapse into a single database write, and the client never waits for the database. For a like counter or a metrics pipeline, losing a few seconds of increments during a rare node failure is an acceptable price for absorbing a huge write rate cheaply. The comparison table lists its write cost as lowest, staleness as low, and data-loss risk as yes, on cache failure, with typical uses of counters, metrics and buffers.\n\nThe decision test from the chapter's quiz: write-back is acceptable only when losing the most recent writes on a cache failure is acceptable, such as approximate counters or metrics, and never for data of record like a user's profile or a payment.",
+    "quiz": {
+      "q": "When is write-back caching acceptable?",
+      "a": "When losing the most recent writes on a cache failure is acceptable, such as approximate counters or metrics, and never for data of record."
+    }
+  },
+  {
+    "id": "ch06-011",
+    "chapter": 6,
+    "section": "6.2 Cache patterns",
+    "title": "Four cache patterns side by side",
+    "body": "The four patterns differ in who fills the cache and when it is updated. Look-aside: the application fills on a miss; write cost is a database write plus delete; used by most web caches and memcache at Meta. Read-through: the cache fills on a miss; same costs; used in integrated caches like Uber CacheFront. Write-through: the cache writes the database synchronously; higher write cost; used for small hot configs and sessions. Write-back: the cache flushes later; lowest write cost; used for counters, metrics and buffers.",
+    "deeper": "The comparison table adds two more columns that decide most choices. Staleness risk: look-aside and read-through both suffer races between a fill and a delete; write-through has low staleness for written keys; write-back is low too since the cache holds the newest value. Data-loss risk: look-aside, read-through and write-through all have none, because the database remains the truth. Only write-back risks loss, on cache failure.\n\nA useful way to read the table: moving from look-aside toward write-back trades durability for write speed, and moving from look-aside toward read-through trades application flexibility for centralized correctness. At big-tech scale the common landing point is look-aside or read-through with delete-on-write for data of record, plus invalidation from the database commit log and a TTL as safety net, while write-back is reserved for data that can tolerate small loss. Write-through appears where a small set of keys must be fresh immediately after writes and write latency is acceptable.",
+    "quiz": {
+      "q": "Which of the four cache patterns is the only one with data-loss risk, and why?",
+      "a": "Write-back, because writes are acknowledged before reaching the database, so a cache node dying before flushing loses them."
+    }
+  },
+  {
+    "id": "ch06-012",
+    "chapter": 6,
+    "section": "6.3 Invalidation and consistency: the hard part",
+    "title": "The stale set: how a paused reader poisons the cache",
+    "body": "Phil Karlton's famous joke says the two hard things in computer science are cache invalidation and naming things. The first race shows why. Reader A misses, reads the old value from the database, then pauses, perhaps for a garbage-collection pause. Writer B updates the database and deletes the cache key. Reader A wakes up and sets the old value into the cache. Now the cache holds stale data with no expiry in sight. Meta's memcache paper calls this a stale set.",
+    "deeper": "The stale set is nasty because every participant did the right thing. The reader followed look-aside exactly, and the writer wrote the database and then deleted the key. The problem is ordering: the writer's delete landed in the gap between the reader's database read and its cache fill, so the delete removed nothing and the fill resurrected old data. Delete-on-write cannot help, because the delete already happened.\n\nWithout further protection, the stale value lives until something else evicts it or a TTL expires it. If no TTL is set, it can live effectively forever. That is why the chapter insists on always setting a TTL even when you also invalidate.\n\nThe specific fixes come later. Meta's leases give each miss a token that a later delete invalidates, so the delayed set is rejected. Uber's CacheFront uses versioning: Lua scripts in Redis compare timestamps so a late fill cannot overwrite fresher data. Both fixes work by letting the cache detect that the fill is older than something that already happened.",
+    "quiz": {
+      "q": "Describe the stale-set race in look-aside caching.",
+      "a": "A reader misses and reads the old value, then stalls. A writer updates the database and deletes the key. The reader then fills the cache with the old value, which stays stale."
+    }
+  },
+  {
+    "id": "ch06-013",
+    "chapter": 6,
+    "section": "6.3 Invalidation and consistency: the hard part",
+    "title": "Replication lag: the delete beats the replica",
+    "body": "The second invalidation race comes from database replication. The application writes to the primary database in one region and deletes the cache key. A reader in another region then misses and reads from its local replica, which has not yet received the write. It fills the cache with the old value. The invalidation was correct and timely, but the data source used to refill the cache was itself stale, so the cache ends up stale again right after being cleaned.",
+    "deeper": "This race appears whenever reads go to asynchronous replicas while writes go to a primary, which is the normal setup for multi-region systems. At Meta, one region holds the primary databases and other regions hold replicas.\n\nTwo industry techniques address it. The first is to tie invalidation to replication itself: Meta's McSqueal invalidations flow with MySQL replication, so a region's cache deletes arrive alongside the data change rather than racing ahead of it. The second is Meta's remote markers. When a web server in a non-primary region writes, it sets a marker in the regional cache, writes to the primary region's database, and deletes the local key. A later reader that sees the marker knows the local replica may be behind and reads from the primary region instead. This protects read-after-write for users outside the primary region.\n\nVersioning also helps when a later fill carries a newer version: an older value cannot overwrite a newer cached one.",
+    "quiz": {
+      "q": "Why can deleting a cache key right after a write still lead to a stale cache in a multi-region setup?",
+      "a": "A reader in another region can miss and refill from a local replica that has not yet received the write, putting the old value back."
+    }
+  },
+  {
+    "id": "ch06-014",
+    "chapter": 6,
+    "section": "6.3 Invalidation and consistency: the hard part",
+    "title": "Lost invalidations: the delete that never arrives",
+    "body": "The third race is the simplest: the invalidation never happens. The application writes the database but crashes before sending the delete to the cache. Or the delete is sent, but over a network that drops it. Either way the database holds the new value while the cache keeps serving the old one, and nothing in the application will ever retry. Any design that relies on application code to remember and successfully deliver every delete will eventually leak stale entries.",
+    "deeper": "This race is why big companies moved invalidation out of application code and into the database's commit log. Meta runs McSqueal on every database: it reads committed SQL statements, extracts the cache keys to invalidate, and broadcasts deletes. Uber's CacheFront uses Flux, which tails the MySQL binlog. Because the log is durable and ordered, an invalidation cannot be lost when an app server crashes, and it can be replayed after a failure. The write is committed if and only if it is in the log, so every committed write eventually produces its delete.\n\nEven then, a TTL remains the backstop for anything that slips through: a bug in key extraction, a code path that writes without going through the normal flow, or an operational mishap. The chapter's failure-mode list states it bluntly: a missed invalidation with no TTL lives forever.\n\nThe common mistake box ties it together: invalidating on write does not make a cache consistent unless these races are handled.",
+    "quiz": {
+      "q": "Why is invalidating from the database commit log more reliable than sending deletes from application code?",
+      "a": "The log is durable and ordered, so invalidations survive app crashes and dropped messages and can be replayed; application-sent deletes can simply be lost."
+    }
+  },
+  {
+    "id": "ch06-015",
+    "chapter": 6,
+    "section": "6.3 Invalidation and consistency: the hard part",
+    "title": "Always set a TTL: it bounds staleness you didn't prevent",
+    "body": "TTL (time to live) makes every cache entry expire after some fixed time. A TTL does not prevent staleness; a stale value still serves until it expires. What it does is bound staleness: no matter which race or bug left an entry wrong, it cannot stay wrong longer than the TTL. The chapter's rule is to always set a TTL, even if you also invalidate on write or from a log. It is the safety net for bugs.",
+    "deeper": "Think of invalidation and TTL as two layers with different jobs. Invalidation, ideally from the commit log, keeps the cache fresh in the normal case, within seconds of a write. TTL guarantees an upper bound when invalidation fails: a stale set, a lost delete, a replication-lag refill, or a bug that writes the database through a path nobody hooked up.\n\nWithout a TTL, the failure mode is severe. The chapter's failure list notes that a missed invalidation with no TTL lives forever, and a stale set can leave data stale with no expiry in sight.\n\nTTL choice has knock-on effects. Short TTLs reduce staleness but increase misses and database load. And many keys written together with the same TTL will expire together, causing a stampede; the chapter's fix is jittered TTLs, such as 1 hour plus or minus 10 minutes. Local in-process caches for hot keys use very short TTLs, measured in seconds, precisely because they receive no invalidations. Gutter pool entries at Meta also expire quickly.",
+    "quiz": {
+      "q": "If you already invalidate caches from the commit log, why still set a TTL?",
+      "a": "TTL bounds how long any stale entry can survive when invalidation fails through bugs, races or unhooked write paths. It is the safety net, not the primary mechanism."
+    }
+  },
+  {
+    "id": "ch06-016",
+    "chapter": 6,
+    "section": "6.3 Invalidation and consistency: the hard part",
+    "title": "McSqueal and Flux: invalidation from the commit log",
+    "body": "Big companies drive invalidation from the database's commit log instead of application code. Meta runs a daemon called McSqueal on every database: it reads committed SQL statements, extracts the cache keys to invalidate, and broadcasts deletes to all frontend clusters in the region. Uber's CacheFront does the same with Flux, which tails the MySQL binlog. Because the log is durable and ordered, invalidations cannot be lost when an app server crashes, and they can be replayed.",
+    "deeper": "The data flow: web servers send SQL writes to the MySQL primary. The primary records them in its commit log or binlog. An invalidation daemon (McSqueal or Flux) reads that log and sends batched deletes to a cache router in each cluster, such as mcrouter, which forwards them to the cache servers. Meanwhile web servers keep doing get, and fill on miss, against the caches.\n\nThis decouples correctness from application code. A team that adds a new write path does not need to remember which keys to delete, as long as the daemon can derive keys from the committed change. At Meta, McSqueal invalidations also flow with MySQL replication to other regions, so deletes in a replica region follow the data that caused them.\n\nAt Uber, Flux invalidates or updates Redis within seconds, and the write path also invalidates directly so the writer gets fresh reads sooner. CacheFront's own design adds Lua timestamp checks, since log-driven invalidation alone does not stop a late fill from resurrecting old data.",
+    "quiz": {
+      "q": "How does McSqueal know which cache keys to delete?",
+      "a": "It reads committed SQL statements from the database's log, extracts the affected cache keys, and broadcasts deletes to the region's frontend clusters."
+    }
+  },
+  {
+    "id": "ch06-017",
+    "chapter": 6,
+    "section": "6.3 Invalidation and consistency: the hard part",
+    "title": "Versioned values: never let old data overwrite new",
+    "body": "Versioning stores a version number or timestamp with each cached value and refuses to overwrite a newer value with an older one. This directly defends against late fills, where a slow reader tries to put stale data into the cache after fresher data is already there. Uber's CacheFront implements this with Lua scripts running inside Redis that compare row timestamps, so a late fill cannot overwrite fresher data. The comparison happens atomically in the cache, not in the application.",
+    "deeper": "Why run the check inside Redis with a Lua script? Because a compare-then-set done from the application would have its own race: two clients could each read the current version, each decide theirs is newer, and both write. A script executes atomically on the Redis server, so the compare and the write happen as one step.\n\nVersioning complements the other techniques. Log-driven invalidation keeps the cache fresh and guarantees deletes are not lost. TTL bounds anything that slips through. Versioning handles the ordering problem: whenever two writes to the cache race, the newer data wins regardless of arrival order. Meta's leases solve a similar problem differently, by invalidating a filler's token when a delete arrives.\n\nThe chapter also recommends versioned values as one way to give read-your-writes to a feature that needs it: a client that knows the version it just wrote can detect an older cached value. The alternative is routing that user's reads to the database for a short time after they write.",
+    "quiz": {
+      "q": "Why does CacheFront compare timestamps inside Redis with Lua scripts rather than in application code?",
+      "a": "The script runs atomically on the server, so the compare and the write cannot interleave with another client's fill, preventing a late fill from overwriting fresher data."
+    }
+  },
+  {
+    "id": "ch06-018",
+    "chapter": 6,
+    "section": "6.3 Invalidation and consistency: the hard part",
+    "title": "Remote markers: read-after-write for far-away users",
+    "body": "Remote markers protect read-after-write for users outside the primary region. When a Meta web server in a non-primary region writes, it first sets a marker in the regional cache, then writes to the primary region's database, then deletes the local cache key. A later reader that sees the marker knows the local replica may not have the write yet, so it reads from the primary region instead of the lagging local replica. Without the marker, it would refill from stale data.",
+    "deeper": "The problem being solved is the replication-lag race. In Meta's design one region holds the primary databases and others hold replicas. A user in a replica region who updates their profile and immediately reloads would otherwise miss the cache, read the local replica, get the old profile and cache it again. Users notice when their own change seems to vanish.\n\nThe marker is a small, cheap signal stored in the fast cache layer. It turns a region-wide consistency problem into a per-key decision: most reads keep using the local replica, and only keys with a recent remote write pay the cost of a cross-region read. That extra latency is limited to the short window when it matters.\n\nThis idea connects to the chapter's advice for read-your-writes in general: route a user's reads to the database (or primary) for a short time after they write, or use versioned values. Remote markers are one production implementation of that routing.",
+    "quiz": {
+      "q": "What problem do Meta's remote markers solve, and how?",
+      "a": "They prevent a reader in a replica region from refilling the cache from a lagging replica after a recent write; seeing the marker, the reader goes to the primary region."
+    }
+  },
+  {
+    "id": "ch06-019",
+    "chapter": 6,
+    "section": "6.3 Invalidation and consistency: the hard part",
+    "title": "Meta: only 4% of invalidations actually hit cached data",
+    "body": "Meta found that most invalidations delete nothing: only 4 percent of deletes hit data that was actually cached. Yet every write still produced deletes, and sending them directly from every database to every cache server created packet rates that were too high. The fix was batching. McSqueal batches deletes and sends them to a few mcrouter servers per cluster, which fan them out to the cache servers. Batching improved the median number of deletes per packet by 18 times.",
+    "deeper": "Why do so few deletes hit anything? A cache holds only what was recently read, and a write invalidates every key that might depend on it, whether or not that key is currently cached. With log-driven invalidation you cannot cheaply know which keys are present, so you send deletes for all of them and most are no-ops. Deletes being idempotent makes this safe.\n\nThe cost is network overhead, not correctness. With many databases and many cache servers, an all-to-all delete stream means a huge number of small packets. Routing through a few mcrouter servers per cluster changes the topology: databases talk to a handful of routers, which pack many deletes per packet and fan them out locally. The 18 times improvement in median deletes per packet is what made commit-log invalidation practical at Meta's scale.\n\nThe broader lesson is that at scale, the invalidation path itself is a traffic source you must engineer, not a free side effect of writes.",
+    "quiz": {
+      "q": "Why did Meta route invalidations through a few mcrouter servers per cluster instead of sending them directly?",
+      "a": "Direct all-to-all deletes created too many packets, and most deleted nothing. Batching through a few routers packed deletes together, improving median deletes per packet by 18 times."
+    }
+  },
+  {
+    "id": "ch06-020",
+    "chapter": 6,
+    "section": "6.3 Invalidation and consistency: the hard part",
+    "title": "Common mistake: 'we invalidate on write, so we're consistent'",
+    "body": "A common mistake is believing that invalidating on write makes the cache consistent. It does not, unless the stale-set, replication-lag and lost-invalidation races are handled. Look-aside caching with delete-on-write is eventually consistent: the cache converges to the database's value, but a reader can briefly or even lastingly see old data. If a feature needs read-your-writes, route that user's reads to the database for a short time after they write, or use versioned values.",
+    "deeper": "The mistake usually shows up as a bug report like 'I changed my name and the old one came back'. The team checks the code, sees the delete right after the write, and concludes the cache must be fine. But the delete only closes one gap. A reader that started before the write can fill old data after the delete. A reader in another region can refill from a lagging replica. A crash between write and delete can skip the invalidation entirely.\n\nDecide explicitly which guarantee each feature needs. Most reads, like counts of friends or post counters, tolerate a few seconds of staleness. Some interactions, like a user seeing their own just-saved edit, need read-your-writes. For those, the chapter suggests short-term routing to the database after a write, which Meta implements across regions with remote markers, or versioned values so an older cached value can be recognized. Add leases or timestamp checks to reject stale fills, a commit-log invalidator to stop lost deletes, and a TTL to bound the rest.",
+    "quiz": {
+      "q": "What consistency does look-aside with delete-on-write give, and how can a feature get read-your-writes?",
+      "a": "Eventual consistency. For read-your-writes, route the user's reads to the database for a short time after they write, or use versioned values."
+    }
+  },
+  {
+    "id": "ch06-021",
+    "chapter": 6,
+    "section": "6.4 Thundering herds, leases and stampedes",
+    "title": "Thundering herds: one expired key, thousands of DB hits",
+    "body": "A thundering herd, also called a cache stampede, happens when a popular key disappears and thousands of requests miss at the same moment. The key might vanish through expiry, invalidation, eviction or a cache restart. All those requests go to the database for the same row. The database slows down, requests time out, clients retry, and the load gets worse rather than better. One missing key can turn a healthy database into an overloaded one in seconds.",
+    "deeper": "The herd is a feedback loop. The first wave of misses adds load; the added load raises database latency; higher latency causes timeouts; timeouts cause retries; retries add more load. Because each missing request would also try to fill the cache, the cache stays empty until one of them completes, prolonging the herd.\n\nPopular keys are the dangerous ones precisely because they are popular: the more requests per second a key receives, the more requests pile up during the few milliseconds it takes to refill it. And databases are provisioned for peak load, so herd spikes directly drive hardware cost.\n\nThe chapter presents several defenses. Meta's leases, which rate-limit refills to one client per key at a time. Request coalescing, or single-flight, merging concurrent misses in one process or proxy. Jittered TTLs so keys written together do not expire together. Early probabilistic refresh of hot keys before they expire. And serving stale data on error when the database is overloaded. Failure-mode mitigations like capped retries and backoff also stop the retry spiral.",
+    "quiz": {
+      "q": "Why does a thundering herd get worse over time instead of resolving itself?",
+      "a": "Simultaneous misses slow the database, causing timeouts and client retries that add even more load, while the key stays uncached until a fill completes."
+    }
+  },
+  {
+    "id": "ch06-022",
+    "chapter": 6,
+    "section": "6.4 Thundering herds, leases and stampedes",
+    "title": "Leases kill the stale set with a 64-bit token",
+    "body": "Meta's leases (2013) fix the stale-set race with one small mechanism. On a miss, memcached gives the client a lease: a 64-bit token tied to that key. The client reads the database and sets the value along with the token. If a delete for that key arrived in the meantime, memcached has already invalidated the token, so the set is rejected. The slow reader holding an old value can no longer overwrite the cache after a writer's delete.",
+    "deeper": "Replay the stale-set race with leases. Reader A misses and receives lease token T for key K. A reads the old value from the database, then pauses. Writer B updates the database and sends delete(K). Memcached deletes K and marks token T invalid. Reader A wakes up and tries set(K, old value, T). Memcached sees T is no longer valid and rejects the set. The next reader misses, gets a fresh token, and fills the current value.\n\nThe beauty is that the cache itself detects the ordering problem. The application does not need timestamps or versions from the database; the token captures 'nothing has changed since you started your read'. The same mechanism doubles as herd protection, as the next card explains.\n\nLeases also allow returning slightly stale values. Recently deleted items are kept briefly, and a client that can tolerate staleness gets the old value instead of waiting for a fresh fill. Uber's CacheFront solves the same stale-fill problem differently, with timestamp comparisons in Redis Lua scripts.",
+    "quiz": {
+      "q": "How do leases prevent the stale-set race?",
+      "a": "A miss gets a token; a delete for that key invalidates the token, so a delayed reader's set with the old value is rejected."
+    }
+  },
+  {
+    "id": "ch06-023",
+    "chapter": 6,
+    "section": "6.4 Thundering herds, leases and stampedes",
+    "title": "Leases tame herds: one refill per key every 10 seconds",
+    "body": "Leases also stop thundering herds. Memcached hands out a lease token for a given key at most once every 10 seconds. Other clients that miss during that window get a wait-and-retry-shortly response instead of going to the database. Usually, by the time they retry, the lease holder has filled the value, so they hit. Meta's paper reports that for keys prone to herds, peak database query rate fell from 17,000 per second to 1,300 per second.",
+    "deeper": "Without leases, every client that misses a hot key goes to the database, so a key receiving thousands of requests per second sends thousands of identical queries. With leases, exactly one client per key per 10-second window is allowed to fetch; everyone else waits a moment and reads the freshly filled value from the cache.\n\nThe 17,000 to 1,300 drop is at peak, and that is the number that matters: databases are provisioned for peak load, so cutting peak queries is a direct hardware saving, not just a nicer average.\n\nLeases add a further option for staleness-tolerant clients. Recently deleted items are kept briefly, and a client that can accept slightly stale data gets the old value immediately instead of waiting for the lease holder. That trades a little freshness for lower latency during the refill.\n\nThe one mechanism therefore solves two problems at once: the token check blocks stale sets, and the rate limit on issuing tokens collapses a herd into a single database read.",
+    "quiz": {
+      "q": "How do leases reduce database load during a thundering herd?",
+      "a": "Only one client per key gets a lease every 10 seconds to refill it; others are told to wait and retry, and usually hit once the holder fills the value."
+    }
+  },
+  {
+    "id": "ch06-024",
+    "chapter": 6,
+    "section": "6.4 Thundering herds, leases and stampedes",
+    "title": "Single-flight: merge identical misses into one backend call",
+    "body": "Request coalescing, also called single-flight, is an anti-stampede technique used within one process or proxy. When several concurrent requests miss on the same key, only one backend call is made; the other requests wait for that call and share its result. Instead of a hundred threads querying the database for the same row, one query runs and a hundred callers get the answer. It needs no coordination with the cache server, just local bookkeeping of in-flight keys.",
+    "deeper": "Coalescing and leases attack the same herd from different places. Leases coordinate at the cache server, across every client in the fleet. Coalescing works locally, inside a single application process or proxy: it keeps a table of keys with a request already in flight, and new requests for those keys attach to the existing call rather than starting another.\n\nThe local scope is both its strength and its limit. It is simple, has no extra round trip, and helps even when the backend is not a cache at all. But with thousands of web servers, each process still sends its own query, so the database can still see one request per process. That is often good enough, and it pairs well with fleet-wide mechanisms like leases.\n\nThe chapter's failure-mode diagram lists request coalescing, leases and load shedding together as mitigations for the stage where database latency and timeouts rise after a hit-ratio drop.",
+    "quiz": {
+      "q": "What is the limitation of request coalescing compared with leases?",
+      "a": "Coalescing only merges misses within one process or proxy, so a large fleet can still send one query per process; leases coordinate across all clients at the cache."
+    }
+  },
+  {
+    "id": "ch06-025",
+    "chapter": 6,
+    "section": "6.4 Thundering herds, leases and stampedes",
+    "title": "Jittered TTLs: don't let a million keys expire at once",
+    "body": "Jittered TTLs add randomness to expiration times so that many keys written together do not all expire together. For example, instead of a fixed 1-hour TTL, use 1 hour plus or minus 10 minutes. Keys loaded in the same burst, such as after a deploy, a warmup or a batch job, would otherwise hit their expiry at the same instant and send a synchronized wave of misses to the database. Jitter spreads those misses over time.",
+    "deeper": "The problem jitter solves is synchronized expiry. Caches are frequently filled in bursts: a cold cache warms up in a few minutes after a restart, or a batch process writes a large set of keys at once. With a fixed TTL, those keys all age out at the same moment one TTL later, and the miss wave repeats every TTL period. It is a thundering herd across many keys instead of on one.\n\nAdding a random offset per key turns that spike into a smooth trickle. In the example, expiries spread across a 20-minute window rather than a single instant, which lowers peak database load, the number that drives provisioning.\n\nJitter is cheap because it changes only how the TTL is computed. It complements the chapter's other techniques: leases and coalescing handle many requests for one key, jitter handles many keys expiring together, and early refresh keeps the hottest keys from expiring at all while they are in demand.",
+    "quiz": {
+      "q": "Why add random jitter to cache TTLs?",
+      "a": "Keys written together would otherwise expire together, causing a synchronized wave of misses; jitter spreads expiries out and lowers peak database load."
+    }
+  },
+  {
+    "id": "ch06-026",
+    "chapter": 6,
+    "section": "6.4 Thundering herds, leases and stampedes",
+    "title": "Refresh early, serve stale on error",
+    "body": "Two more anti-stampede techniques keep a hot key available while its value is renewed. Early, or probabilistic, refresh reloads a hot key in the background shortly before it expires, so readers never see a miss. Serve stale on error means that if the database is overloaded, the cache returns the expired value rather than failing the request. Both trade a little freshness for availability, avoiding the moment where many readers find nothing and rush the database together.",
+    "deeper": "Early refresh attacks the root cause of expiry herds: the key disappearing. If a background refresh replaces the value just before its TTL ends, the key never goes missing, so there is no miss wave. Making the refresh probabilistic, so that only some requests near expiry trigger it, avoids every request triggering a refresh at once.\n\nServe stale on error is a degradation mode. Under normal conditions, expired values are not served. When the database is overloaded, returning a slightly old value keeps the user experience working and, crucially, avoids adding load to a database that is already struggling. This is the same philosophy as Meta's lease feature that keeps recently deleted items briefly and hands them to clients that can tolerate staleness.\n\nBoth techniques only make sense for data where brief staleness is acceptable, such as counters, feeds or profiles. For data needing read-your-writes, the chapter's advice is to route reads to the database after a write or use versioned values instead.",
+    "quiz": {
+      "q": "How does early probabilistic refresh prevent a stampede on a hot key?",
+      "a": "It reloads the key in the background just before expiry, so the key never goes missing and readers never produce a simultaneous miss wave."
+    }
+  },
+  {
+    "id": "ch06-027",
+    "chapter": 6,
+    "section": "6.5 Hot keys",
+    "title": "Hot keys: why sharding the cache can't save you",
+    "body": "A hot key is a single key that gets a huge share of traffic: a celebrity's profile, a viral post, or a global configuration value. Sharding the cache does not help, because one key lives on one shard; adding servers spreads different keys, not the load of one key. Meta noted that a single key can account for 20 percent of a server's requests. That one server saturates while the rest of the cluster sits comfortably idle.",
+    "deeper": "Sharding, whether by consistent hashing or hash slots, maps each key to exactly one owner. That balances load well when traffic spreads over many keys of similar popularity. It fails when traffic concentrates: if one key alone exceeds what a single server can handle, no amount of resharding fixes it, since that key must land somewhere.\n\nHot keys also make failures worse. If the server holding a hot key dies and its keys are rehashed onto survivors, the hot key can overload the next server, which dies, and so on. Meta's Gutter pool exists partly to prevent this cascade.\n\nThe chapter's fixes all change where reads for the key are served rather than how keys are partitioned: replicate hot keys across several cache servers and spread reads, cache the hottest keys locally inside the application with a short TTL, split a key into several copies, and detect hot keys by sampling per-key traffic in the cache proxy so they can be handled before they cause an outage.",
+    "quiz": {
+      "q": "Why doesn't adding more cache shards fix a hot key?",
+      "a": "Each key maps to exactly one shard, so all traffic for that key still lands on one server no matter how many shards exist."
+    }
+  },
+  {
+    "id": "ch06-028",
+    "chapter": 6,
+    "section": "6.5 Hot keys",
+    "title": "Replicate hot keys: Meta's replicated pools, EVCache per zone",
+    "body": "The main fix for hot keys is replicating them across several cache servers and spreading reads across the copies. Meta uses replicated pools for this: a set of keys is stored in full on multiple servers, so any replica can answer. Netflix EVCache keeps a full copy of the data in each availability zone and reads from the local zone. Instead of one server absorbing a hot key's entire read rate, the load divides across every copy.",
+    "deeper": "Replication trades memory and write work for read capacity. Each extra copy costs memory, and every write or invalidation must reach all copies. That is why it is applied selectively. Meta places workloads with different patterns in separate pools, and keys that benefit from replication go into a replicated pool rather than duplicating everything.\n\nEVCache applies replication more broadly for a different reason. Keeping a full copy per availability zone means reads stay local to the zone, which cuts latency and cross-zone traffic, and a missing item locally (instance failure or eviction) can be read from another zone. Writes go to all zones. Hot keys get spread across zones as a side effect.\n\nThe senior staff lens for this section sums up the principle: no partitioning scheme fixes a hot key, so the design must replicate its reads or move them closer to the client. Replication is the first half of that; local in-process caching is the second.",
+    "quiz": {
+      "q": "What does replicating a hot key cost, in exchange for spreading its reads?",
+      "a": "Extra memory for each copy, and every write or invalidation must update all copies."
+    }
+  },
+  {
+    "id": "ch06-029",
+    "chapter": 6,
+    "section": "6.5 Hot keys",
+    "title": "In-process caches: take the hottest keys off the network",
+    "body": "For the very hottest keys, the application can keep a local, in-process cache with a short TTL, measured in seconds. Reads for those keys are then answered from the application's own memory without any network call, which takes their load off the network and cache servers entirely. The short TTL is essential: an in-process copy typically receives no invalidations, so the TTL is what bounds how stale it can get. A few seconds of staleness buys huge relief.",
+    "deeper": "The math behind local caching is attractive for hot keys. If a global configuration value is read on every request by thousands of web servers, a local copy refreshed every few seconds turns millions of cache reads per second into a handful of refreshes per server. The shared cache server that owns that key stops being a bottleneck.\n\nThe cost is consistency. Each process has its own copy, refreshed on its own schedule, so different servers can briefly disagree, and a write takes up to one TTL to become visible everywhere. That is fine for configuration, viral post contents or celebrity profiles where a few seconds of lag is harmless, and not fine where users need read-your-writes.\n\nLocal caching also costs application memory, so it is kept to the very hottest keys. To know which keys those are, the chapter recommends detection: sample per-key traffic in the cache proxy and flag keys above a threshold.",
+    "quiz": {
+      "q": "Why must an in-process hot-key cache use a very short TTL?",
+      "a": "Local copies usually get no invalidations, so the short TTL is the only thing bounding how stale each server's copy can become."
+    }
+  },
+  {
+    "id": "ch06-030",
+    "chapter": 6,
+    "section": "6.5 Hot keys",
+    "title": "Key splitting: store key#1 to key#N and pick one at random",
+    "body": "Key splitting spreads a hot key by storing several copies under different names, such as key#1 through key#N. Each copy hashes to a different shard, so reads, which pick a random copy, spread across N servers instead of hammering one. The catch is on writes: every write must update or delete all N copies, or readers will see different versions depending on which copy they happen to pick. It is a manual form of replication built on ordinary sharding.",
+    "deeper": "Key splitting works with any sharded cache, without special replication support in the cache servers. Because the suffix changes the key, consistent hashing or hash slots will scatter the copies across the cluster, and the read load for the original key divides by roughly N.\n\nThe complexity lives in the application. Writers must know the key is split and how many copies exist, and invalidate all of them. If one delete is lost, one copy stays stale and a fraction of readers see old data; a TTL on each copy bounds that. Changing N later requires care so no copy is orphaned.\n\nThat is why key splitting is typically reserved for keys known to be hot, found through detection: sampling traffic per key in the cache proxy and alerting on keys above a threshold. The senior staff lens adds the planning angle: ask for the expected top-1 key rate, not just total rate, so you know in advance whether any key will need this treatment.",
+    "quiz": {
+      "q": "What must writes do when a hot key is split into key#1 through key#N?",
+      "a": "Update or delete all N copies; otherwise readers picking different copies see different versions."
+    }
+  },
+  {
+    "id": "ch06-031",
+    "chapter": 6,
+    "section": "6.5 Hot keys",
+    "title": "Senior lens: ask for the top-1 key rate, not just total QPS",
+    "body": "Hot keys are the cache version of DynamoDB's single hot item from Chapter 5: no partitioning scheme fixes them. The design must replicate reads or move them closer to the client. So in design reviews, ask for the expected top-1 key rate, not just the total request rate. A system can handle its total load comfortably and still fall over because one key exceeds one server. Pair this with detection: sample traffic per key in the cache proxy and flag keys above a threshold.",
+    "deeper": "Total request rate tells you how many servers you need when load is evenly spread. The top-1 key rate tells you whether any single server will be overwhelmed regardless of how many you have. These are different capacity questions, and designs usually only answer the first.\n\nIf the top-1 rate is below what one server handles comfortably, ordinary sharding works. If it is close to or above, you need a hot-key strategy up front: replicated pools, per-zone copies, local in-process caching with short TTLs, or key splitting.\n\nDetection covers the keys you did not predict. A viral post or sudden celebrity event creates a hot key nobody planned for. A cache proxy, which already sees every request, can sample per-key traffic and flag keys over a threshold so operators or automation can replicate them. Meta's observation that a single key can reach 20 percent of a server's requests shows the scale of imbalance this can reach. Hot keys also shape failure design: the Gutter pool avoids rehashing a hot key onto a healthy server.",
+    "quiz": {
+      "q": "Why should a design review ask for the expected top-1 key rate, not only total request rate?",
+      "a": "Total rate sizes the fleet, but one key maps to one server; if that key's rate exceeds a server's capacity, sharding cannot help and replication or local caching is needed."
+    }
+  },
+  {
+    "id": "ch06-032",
+    "chapter": 6,
+    "section": "6.6 Meta: Scaling Memcache (NSDI 2013)",
+    "title": "Scaling Memcache at Facebook: the simple server, the huge system",
+    "body": "The NSDI 2013 paper 'Scaling Memcache at Facebook' describes the largest memcached deployment of its time: billions of requests per second and trillions of items (2013). Memcached itself is a simple in-memory key-value server with just get, set and delete. Meta's contribution is everything around it: routing, networking, pools, failure handling, invalidation and cross-region consistency. Inside a cluster, many memcached servers hold keys spread by consistent hashing, and a page load can fetch hundreds of keys.",
+    "deeper": "Because a single page load can fetch hundreds of keys spread across many servers, latency depends on fan-out: the page waits for the slowest of those responses. That shapes many design choices in the paper, from UDP gets to flow control.\n\nThe system has three layers. Inside a cluster: memcached servers, consistent hashing, UDP gets, mcrouter for sets and deletes, flow control against incast, pools for different workloads, and a Gutter pool for failures. Across clusters in a region: several frontend clusters share one storage cluster, each frontend cluster with its own full cache, plus a shared regional pool and Cold Cluster Warmup. Across regions: primary databases in one region, replicas elsewhere, with McSqueal invalidations flowing alongside MySQL replication and remote markers protecting read-after-write.\n\nMeta calls this a demand-filled look-aside cache, so all of the look-aside races apply, and the paper introduced leases to address the stale sets and herds. Later, TAO took over many social-graph reads from this layer.",
+    "quiz": {
+      "q": "In Meta's memcache design, why does latency depend so much on fan-out?",
+      "a": "A page load fetches hundreds of keys across many servers and must wait for the slowest response, so the tail of many parallel requests sets page latency."
+    }
+  },
+  {
+    "id": "ch06-033",
+    "chapter": 6,
+    "section": "6.6 Meta: Scaling Memcache (NSDI 2013)",
+    "title": "UDP gets: drop 0.25% of reads, gain 20% lower latency",
+    "body": "Meta's web servers send memcache gets over UDP directly to the cache servers, avoiding the overhead of TCP connections. At peak, about 0.25 percent of gets are dropped, and clients simply treat those as cache misses. In exchange, UDP gave about 20 percent lower latency than TCP via mcrouter. Only reads use this path; sets and deletes, which must not be silently lost, still go over TCP. It works because a cache is allowed to lose data.",
+    "deeper": "This choice is a direct application of the chapter's founding property: a cache can lose data and the system stays correct. A dropped UDP get is indistinguishable from a miss, so correctness is unaffected; the only cost is a small amount of extra database load from those false misses.\n\nThere is a subtlety in handling errors. The failure-mode section notes that Meta's clients skip the fill after a UDP get error, to avoid adding load. The request goes to the database for the value, but the client does not write it back into the cache, since the error might indicate congestion and an extra set would make it worse.\n\nWhy not UDP for writes? A dropped delete is a lost invalidation, one of the three core consistency races, and a dropped set wastes a database read. So sets and deletes go over TCP through mcrouter, trading a little latency for reliable delivery. At scale, connection overhead matters: with many web servers talking to many cache servers, avoiding per-connection state for the high-volume read path is significant.",
+    "quiz": {
+      "q": "Why can Meta safely send memcache gets over UDP but not deletes?",
+      "a": "A dropped get just looks like a miss, so correctness holds. A dropped delete is a lost invalidation that leaves stale data, so deletes go over reliable TCP."
+    }
+  },
+  {
+    "id": "ch06-034",
+    "chapter": 6,
+    "section": "6.6 Meta: Scaling Memcache (NSDI 2013)",
+    "title": "mcrouter: the proxy that handled 5 billion requests per second",
+    "body": "At Meta, sets and deletes travel over TCP through mcrouter, a proxy that runs on each web server. mcrouter speaks the memcached protocol, so clients talk to it as if it were memcached. It pools connections to cache servers and routes requests by key prefix, which is how different key families can be sent to different pools. By 2014 mcrouter handled close to 5 billion requests per second at peak. It also relays McSqueal's batched invalidations inside clusters.",
+    "deeper": "Running mcrouter locally on each web server gives two big wins. Connection pooling: instead of each application thread opening connections to every cache server, mcrouter maintains shared connections, cutting connection counts and overhead. Routing by key prefix: the key's prefix decides which pool it belongs to, so a low-value, high-churn key family can live in its own pool and not evict valuable keys.\n\nBecause mcrouter speaks the memcached protocol, applications need no special client library; they just send memcached commands. That makes it easy to add routing policies, such as sending a failed server's traffic to the Gutter pool, without changing application code.\n\nmcrouter also plays a role in invalidation. McSqueal does not send deletes directly to every cache server; it sends batched deletes to a few mcrouter servers per cluster, which fan them out. Batching through this layer improved median deletes per packet by 18 times. The chapter's invalidation diagram shows the same pattern generically: a cache router per cluster receiving batched deletes from the invalidation daemon.",
+    "quiz": {
+      "q": "Why does Meta route cache traffic by key prefix in mcrouter?",
+      "a": "The prefix identifies the key family, letting mcrouter send different workloads to separate pools so, for example, high-churn low-value keys do not evict valuable ones."
+    }
+  },
+  {
+    "id": "ch06-035",
+    "chapter": 6,
+    "section": "6.6 Meta: Scaling Memcache (NSDI 2013)",
+    "title": "Incast: when too many answers arrive at once",
+    "body": "Incast congestion happens when many responses arrive at one client at the same time and overflow network switch buffers, causing packet loss and retransmission delays. Meta's page loads fetch hundreds of keys in parallel, making this a real risk: all the cache servers reply together to one web server. Meta's clients use flow control, a sliding window that limits the number of outstanding requests, so responses arrive in manageable waves instead of one burst that the switch cannot buffer.",
+    "deeper": "Incast is a consequence of fan-out. When one web server requests hundreds of keys spread across many cache servers, those servers are each fast and each reply immediately, so their responses converge on the same switch port at nearly the same instant. Switch buffers are finite; once full, packets are dropped. Dropped packets mean retransmissions or, for UDP gets, false misses, both of which hurt latency.\n\nA sliding window caps how many requests are outstanding at any moment. Too small a window and the client serializes requests, adding latency; too large and incast returns. The window lets the client keep the network busy without overwhelming it.\n\nThe chapter's failure-mode list generalizes the point: a page that fetches 500 keys waits for the slowest, so batch requests, cap fan-out, and watch incast. Large values make it worse because each response carries more bytes into the same buffers. Fan-out is thus both a latency problem and a network capacity problem.",
+    "quiz": {
+      "q": "What is incast congestion and how did Meta's clients avoid it?",
+      "a": "Many simultaneous responses to one client overflow switch buffers. Clients use a sliding window limiting outstanding requests so replies arrive in manageable waves."
+    }
+  },
+  {
+    "id": "ch06-036",
+    "chapter": 6,
+    "section": "6.6 Meta: Scaling Memcache (NSDI 2013)",
+    "title": "Pools: stop churny keys from evicting valuable ones",
+    "body": "Meta splits its memcached servers into pools: separate groups of servers for workloads with different access patterns. The goal is isolation. A low-value, high-churn key set, one that is written often and rarely re-read, would otherwise push valuable, frequently read keys out of memory in a shared cache. By giving each workload its own pool, eviction pressure from one workload cannot destroy another workload's hit ratio. mcrouter routes each key to the right pool by key prefix.",
+    "deeper": "Caches evict when memory fills. In a shared cache, the keys that survive are whatever the eviction policy favors, and a workload that writes lots of keys can dominate memory even if nobody reads them twice. The keys it pushes out may be exactly the ones that were saving the database the most load.\n\nPools also let each workload get the right treatment. Keys with very high read rates can go into a replicated pool, where each key has copies on several servers, which is how Meta spreads hot keys. Large, less popular items go into a shared regional pool rather than being duplicated in every frontend cluster.\n\nThe failure-mode section names the problem 'eviction surprises': a new feature writes many low-value keys and evicts valuable ones. The fix it recommends is separate pools, as at Meta, or separate clusters per workload. It is an operational lesson too: launching a new caching workload into a shared cache can silently raise database load for an unrelated service.",
+    "quiz": {
+      "q": "Why does Meta use separate pools for different workloads?",
+      "a": "So a low-value, high-churn workload cannot evict another workload's valuable keys, protecting each workload's hit ratio."
+    }
+  },
+  {
+    "id": "ch06-037",
+    "chapter": 6,
+    "section": "6.6 Meta: Scaling Memcache (NSDI 2013)",
+    "title": "The Gutter pool: 1% idle servers cut failures by 99%",
+    "body": "Meta keeps about 1 percent of memcached servers idle as a Gutter pool. When a cache server fails, clients send its traffic to Gutter instead of rehashing its keys onto other servers in the cluster. Rehashing could push a hot key onto a healthy server and overload it, causing a cascade. Gutter entries expire quickly, limiting staleness since Gutter gets no normal invalidations. This small reserve cut client-visible failures by 99 percent.",
+    "deeper": "The naive failure response in a consistent-hashing cluster is to remap the dead server's keys to its neighbors. The problem is uneven load: if the dead server held a hot key, a neighbor suddenly receives that key's traffic on top of its own, may fail, and push the load onward. The failure-mode section calls this failure rehashing: a hot key can overload the next node, which dies, and so on.\n\nGutter breaks the chain. The failed server's traffic goes to dedicated idle servers that have spare capacity by design, so no healthy server's load changes. Misses to Gutter are filled from the database, and the short expiry keeps any stale data short-lived.\n\nThe cost is holding roughly 1 in 100 servers mostly idle, a small price for a 99 percent reduction in client-visible failures. The chapter's failure cascade diagram lists the Gutter pool alongside warm restart and cold cluster warmup as the mitigations for the first stage: cache nodes restarting or failing and the hit ratio dropping.",
+    "quiz": {
+      "q": "Why is rehashing a failed cache node's keys onto other nodes risky, and what did Meta do instead?",
+      "a": "Load per key is uneven, so a moved hot key can overload a healthy node and cascade. Meta sends failed nodes' traffic to a small idle Gutter pool with short TTLs."
+    }
+  },
+  {
+    "id": "ch06-038",
+    "chapter": 6,
+    "section": "6.6 Meta: Scaling Memcache (NSDI 2013)",
+    "title": "Across clusters and regions: duplication, sharing, markers",
+    "body": "Within a Meta region, several frontend clusters share one storage cluster. Each frontend cluster has its own full cache, so popular data is duplicated across clusters. Less popular, large items go into a shared regional pool to save memory. Across regions, one region holds the primary databases and others hold replicas. McSqueal invalidations flow along with MySQL replication, and remote markers protect read-after-write for users in non-primary regions by sending their reads to the primary region.",
+    "deeper": "The per-cluster full cache is a deliberate trade. Duplicating popular data costs memory, but it keeps each frontend cluster self-contained: web servers read from nearby cache servers and a failure in one cluster does not affect others. For popular keys, the extra copies also spread load.\n\nFor large, rarely read items the trade flips. Duplicating them in every cluster wastes a lot of memory for little hit-ratio benefit, so they go into one shared regional pool, used by all frontend clusters in the region.\n\nInvalidation must reach every copy. McSqueal on each database extracts keys from committed SQL and broadcasts deletes to all frontend clusters in the region, batched through mcrouter. Across regions, those invalidations travel with MySQL replication, so a replica region's caches are cleaned in step with its data.\n\nThe cross-region read-after-write gap is covered by remote markers: a writer in a non-primary region sets a marker in the regional cache, writes to the primary database, and deletes the local key; readers seeing the marker go to the primary region.",
+    "quiz": {
+      "q": "Why does Meta put large, less popular items in a shared regional pool rather than in each frontend cluster's cache?",
+      "a": "Duplicating them in every cluster wastes memory for little hit-ratio gain; one shared pool per region saves memory, while popular data stays duplicated per cluster."
+    }
+  },
+  {
+    "id": "ch06-039",
+    "chapter": 6,
+    "section": "6.6 Meta: Scaling Memcache (NSDI 2013)",
+    "title": "Cold Cluster Warmup: hours instead of days",
+    "body": "When a new Meta frontend cluster comes online, its cache is empty, and sending all its misses to the database would be dangerous. Cold Cluster Warmup lets the cold cluster read its misses from a warm cluster's cache instead of the database. This brings the new cluster to full capacity in a few hours instead of a few days. To avoid races during warmup, deletes to the cold cluster carry a two-second hold-off, preventing stale data from being refilled.",
+    "deeper": "Why is a cold cluster dangerous? A cache at 99 percent hit ratio sends 1 percent of reads to the database; an empty cache sends 100 percent. A new cluster serving real traffic with an empty cache would multiply database load until it filled, and filling from the database alone takes days for the long tail of keys.\n\nWarmup redirects those misses to a peer cluster that already holds the data, since each frontend cluster has its own full cache of similar content. The database is spared, and the cold cluster fills far faster.\n\nThe race: the cold cluster fetches a value from the warm cluster, while a write deletes that key in both. If the warm cluster's copy was fetched just before its delete, the cold cluster could set stale data just after its own delete. The two-second hold-off rejects sets for a key for a short time after it is deleted in the cold cluster, closing that window.\n\nThe failure-mode section lists cold cluster warmup from a warm peer among the mitigations for cold caches after restarts or deploys.",
+    "quiz": {
+      "q": "How does Meta's Cold Cluster Warmup protect the database, and why the two-second hold-off?",
+      "a": "The cold cluster reads misses from a warm cluster instead of the database. The hold-off on deletes prevents a warm-cluster fetch from refilling a just-deleted key with stale data."
+    }
+  },
+  {
+    "id": "ch06-040",
+    "chapter": 6,
+    "section": "6.6 Meta: Scaling Memcache (NSDI 2013)",
+    "title": "TAO: a cache that understands the social graph",
+    "body": "TAO later took over many social-graph reads from Meta's memcache layer. Unlike memcached, TAO is a cache that understands the graph model of nodes and edges. Follower tiers serve client requests. Leader tiers, one per shard, read and write MySQL and send invalidations to the followers. Because all writes to a shard go through one leader, TAO avoids many look-aside races by design. It handled a billion reads per second in 2013.",
+    "deeper": "TAO shows an alternative to patching look-aside races one by one. In the memcache design, many independent web servers read the database, fill the cache and send deletes, and races arise from their uncoordinated interleaving: stale sets, lost invalidations, and ordering problems. Leases, McSqueal and remote markers were added to manage them.\n\nIn TAO, the leader for a shard is the single path for writes to that shard's data. It writes MySQL and then invalidates the follower tiers, so there is one ordered stream of changes per shard rather than many competing clients. Followers serve reads and ask the leader on misses. Serializing writes through a leader removes much of the ambiguity about which update came last.\n\nUnderstanding the data model also helps: the cache knows about graph objects and associations rather than opaque keys, fitting Meta's graph-heavy workload. It is a precursor to the integrated-cache trend the chapter highlights with Uber's CacheFront: when the data platform owns the cache, application code cannot forget to invalidate.",
+    "quiz": {
+      "q": "Why does TAO avoid many look-aside races by design?",
+      "a": "All writes to a shard go through one leader tier that writes MySQL and invalidates followers, giving a single ordered write path instead of many uncoordinated clients."
+    }
+  },
+  {
+    "id": "ch06-041",
+    "chapter": 6,
+    "section": "6.7 Meta CacheLib (OSDI 2020) and flash caching",
+    "title": "CacheLib: one caching engine instead of many rebuilt ones",
+    "body": "By 2017 Meta had many separate caching systems, for the CDN, the social graph, storage and application caches, each with its own team rebuilding the same features. CacheLib is a C++ caching library that extracts the common core so every system can share it. First deployed in 2017, it powered over 70 services by 2020, as described in its OSDI 2020 paper. Its standout ideas are hybrid DRAM plus flash caching, flash-friendly storage engines, admission policies and warm restarts.",
+    "deeper": "The motivation is engineering economics. Each caching team was independently implementing eviction, memory management, concurrency, persistence across restarts and flash support. Features built by one team did not help another, and bugs were fixed many times over. A shared library turns those into common investments: an improvement in CacheLib benefits every service that links it.\n\nCacheLib is a library, not a server, which is why it could slot into so many different systems, from CDN edge caches to social-graph caches to storage caches. Each service keeps its own protocol and deployment while sharing the caching engine.\n\nThe paper also made two contributions beyond the code. It quantified cache benefits, noting that a single caching server can replace tens of backend database servers thanks to about 20 times higher throughput and hit ratios above 80 percent. And it measured real production workloads, finding popularity less skewed and more volatile than textbook models, which strengthens the case for larger caches and therefore for flash. Meta's CDN edge caches, which serve 70 percent of web requests, are among its users.",
+    "quiz": {
+      "q": "Why did Meta build CacheLib as a shared library?",
+      "a": "Many separate caching systems were each rebuilding the same features; a common C++ core let over 70 services share one engine and its improvements."
+    }
+  },
+  {
+    "id": "ch06-042",
+    "chapter": 6,
+    "section": "6.7 Meta CacheLib (OSDI 2020) and flash caching",
+    "title": "Hybrid DRAM plus flash: more cache per dollar",
+    "body": "CacheLib caches in two tiers: DRAM first, then flash. DRAM is fast but expensive and limited in size. Flash (SSD) gives many times more capacity per dollar and still offers sub-millisecond reads. On a lookup, CacheLib checks DRAM first; on a DRAM miss it checks flash before falling back to the backend. The result is a much bigger cache for the same budget, able to hold far more of the long tail of less popular items.",
+    "deeper": "The economics come from the long tail. Hot items fit in DRAM, but many workloads have a large set of items that are each read occasionally. Keeping them in DRAM is too expensive; letting them miss sends a steady stream of reads to the backend. Flash sits in between: slower than DRAM but much faster than a database read that touches disk and replicas.\n\nFlash brings two engineering problems that shape CacheLib's design. Endurance: flash wears out with writes, and cache contents churn fast, so writing every evicted item would burn through devices. Admission policies control this. Indexing: keeping a DRAM index entry for every item on a large flash device can cost too much DRAM, especially for small items. The Small Object Cache avoids a per-item index.\n\nThe chapter's senior staff lens frames the payoff: when the working set is 10 times bigger than affordable DRAM, a DRAM-only cache has a poor hit ratio and the backend pays, while DRAM plus flash can hold the long tail.",
+    "quiz": {
+      "q": "What does adding a flash tier behind DRAM buy a cache?",
+      "a": "Many times more capacity per dollar with sub-millisecond reads, so the long tail of less popular items can be served from cache instead of the backend."
+    }
+  },
+  {
+    "id": "ch06-043",
+    "chapter": 6,
+    "section": "6.7 Meta CacheLib (OSDI 2020) and flash caching",
+    "title": "LOC and SOC: two flash engines for big and tiny items",
+    "body": "CacheLib uses two flash engines. The Large Object Cache (LOC) stores items of 2 KB and larger, aligned to 4 KB flash pages, and keeps a compact index in DRAM to find them. The Small Object Cache (SOC) stores items under 2 KB by hashing them into 4 KB buckets on flash, so it needs almost no DRAM index. Small objects, like social-graph edges and nodes, are very common, so avoiding a per-item DRAM index matters enormously.",
+    "deeper": "Why two engines? The cost of indexing grows with the number of items, not their size. For large items, an index entry per item is a tiny overhead relative to the data, so LOC can afford a DRAM index and place each item directly on page-aligned flash.\n\nFor small items, a per-item index would be ruinous. A flash device holds a huge number of sub-2 KB objects, and a DRAM entry for each could approach the size of the objects themselves, defeating the point of using flash to save DRAM. SOC sidesteps this: an item's key hashes to one 4 KB bucket on flash, so the location is computed rather than looked up. Reading an item means reading its bucket and searching within it.\n\nThe layouts also matter for flash wear. The chapter's quiz answer lists flash layouts designed to limit application-level write amplification as one of two ways CacheLib reduces wear, alongside admission policies. Aligning writes to 4 KB flash pages and buckets fits how the device works.",
+    "quiz": {
+      "q": "Why does CacheLib's Small Object Cache hash items into 4 KB flash buckets instead of indexing each item in DRAM?",
+      "a": "Small items are extremely numerous, so a per-item DRAM index would cost too much; hashing to a bucket computes the location and needs almost no DRAM."
+    }
+  },
+  {
+    "id": "ch06-044",
+    "chapter": 6,
+    "section": "6.7 Meta CacheLib (OSDI 2020) and flash caching",
+    "title": "Flash admission: don't write every evicted item",
+    "body": "Flash wears out with writes, and cache contents churn quickly. If every item evicted from DRAM were written to flash, the devices would wear out fast. CacheLib therefore uses admission policies: it does not write every evicted item to flash. The default policy admits items with a fixed probability, for example writing only some fraction of candidates. That gives operators direct control over the flash write rate, and therefore over device lifetime, at the cost of not caching some items on flash.",
+    "deeper": "Admission is the core trade-off of flash caching. Admit everything and you maximize the chance of a flash hit but burn flash endurance; admit too little and flash sits underused while the backend pays for misses. A probabilistic policy is simple and predictable: the write rate scales directly with the admission probability, so you can set it to match the device's endurance budget.\n\nThe chapter's quiz asks for two ways CacheLib reduces flash wear: probabilistic (or other) admission policies that write only some evicted items to flash, and flash layouts, LOC and SOC, designed to limit application-level write amplification.\n\nThe senior staff lens on flash caches names the cost directly: flash endurance must be managed by controlling the write rate with admission policies, and flash hits carry slightly higher latency than DRAM hits. The key takeaways repeat the point: flash caching extends cache capacity cheaply, but control flash writes with admission policies. Aerospike's hybrid layout faces a related trade-off as a database rather than a cache.",
+    "quiz": {
+      "q": "Name two ways CacheLib reduces flash wear.",
+      "a": "Admission policies that write only some evicted items to flash (default: fixed probability), and flash layouts (LOC and SOC) that limit write amplification."
+    }
+  },
+  {
+    "id": "ch06-045",
+    "chapter": 6,
+    "section": "6.7 Meta CacheLib (OSDI 2020) and flash caching",
+    "title": "Warm restarts: deploys shouldn't empty the cache",
+    "body": "Production caches restart often, mainly for code deploys; many of Meta's run less than 7 days between restarts. A normal restart leaves the cache empty, forcing it to refill from the backend and hitting the database hard. CacheLib supports warm restarts: it can save its state before shutting down and reattach to it after the restart, so the cache comes back full instead of empty. Frequent deploys then no longer mean frequent cold caches and database load spikes.",
+    "deeper": "The problem compounds with scale. If each cache server restarts every few days, then at any time some fraction of the fleet is cold and refilling. Restart many at once, as in a fleet-wide deploy, and the database sees a surge. The failure-mode section lists cold cache after restart or deploy as the first failure mode, with mitigations: roll restarts slowly, warm restarts (CacheLib), cold cluster warmup from a warm peer (Meta), and cross-region replication (EVCache, CacheFront).\n\nWarm restarts are the cheapest of these because the data never leaves the machine. Rather than rebuilding from the database or copying from another cluster, the process hands off its saved state to the new version.\n\nThis matters more for large caches. A DRAM plus flash cache holding the long tail takes a long time to fill organically because long-tail items are, by definition, rarely requested. Losing that on every deploy would erase much of the benefit of having a big cache in the first place.",
+    "quiz": {
+      "q": "Why are warm restarts especially valuable for caches that are deployed frequently?",
+      "a": "Each normal restart empties the cache and spikes database load while refilling; saving and reattaching state lets frequent deploys keep caches full."
+    }
+  },
+  {
+    "id": "ch06-046",
+    "chapter": 6,
+    "section": "6.7 Meta CacheLib (OSDI 2020) and flash caching",
+    "title": "Real workloads aren't very Zipf: the case for big caches",
+    "body": "The CacheLib paper measured real production workloads and found that popularity is often less skewed than the textbook Zipf assumption. The social-graph and CDN workloads had a Zipf alpha around 0.55, meaning traffic is spread across more items instead of concentrating on a few. Popularity also changes quickly, over hours. Both findings make caching harder and larger caches more valuable, because a small cache of the top items misses a lot. That is the case for flash.",
+    "deeper": "Zipf distributions model popularity where a few items get most of the traffic. The steeper the skew, the more a small cache of the most popular items can capture. With a flatter distribution like alpha around 0.55, the hit ratio grows more slowly with cache size: to catch most requests you need to hold a much larger share of the items.\n\nFast-changing popularity adds churn: yesterday's hot items cool off and new ones appear within hours, so the cache is constantly replacing contents, which also increases write pressure on flash.\n\nTogether these push toward bigger caches, and bigger caches are affordable only with cheaper media. That is why the paper connects its measurements to flash: DRAM plus flash can hold the long tail that a DRAM-only cache cannot afford. The sizing section shows why each point of hit ratio matters so much: in the running example, every 1 percent of hit ratio gained removes 20,000 database reads per second at peak.",
+    "quiz": {
+      "q": "Why does a less skewed popularity distribution make larger (flash) caches more valuable?",
+      "a": "Traffic spreads over more items, so a small cache of top items catches less; holding more of the long tail is needed for a good hit ratio, which flash makes affordable."
+    }
+  },
+  {
+    "id": "ch06-047",
+    "chapter": 6,
+    "section": "6.7 Meta CacheLib (OSDI 2020) and flash caching",
+    "title": "Aerospike: index in DRAM, records on SSD, one flash read",
+    "body": "Aerospike applies a related idea to a database rather than a cache. Its Hybrid Memory Architecture keeps the primary index in DRAM and the records themselves on SSD. Because the index is always in memory, finding a record never needs a flash read, and fetching it needs exactly one. So every lookup costs at most one flash read. It gets much of the speed of an in-memory store at the capacity and cost of flash, while still being a durable store.",
+    "deeper": "The comparison with CacheLib's Large Object Cache is instructive: both keep a compact index in DRAM and the bulk of the data on flash, so a lookup goes straight to the right flash location. The difference is role. CacheLib is a cache that can lose data and refill from a backend; Aerospike is a database, so the records on SSD are the real data.\n\nThe design gives predictable latency, since the worst case is a single flash read, not a chain of index page reads from disk as a B-tree on SSD might require. The trade-off is DRAM cost for the index: it scales with the number of records, which is exactly the problem CacheLib's Small Object Cache avoids for tiny items by hashing into buckets instead.\n\nThe key takeaways group it with CacheLib: flash caching and Aerospike-style layouts extend capacity cheaply, provided you control flash writes. It shows the same hardware economics shaping both caches and primary stores.",
+    "quiz": {
+      "q": "How does Aerospike's Hybrid Memory Architecture guarantee at most one flash read per lookup?",
+      "a": "The primary index lives entirely in DRAM, so locating a record needs no flash access; only reading the record itself touches the SSD."
+    }
+  },
+  {
+    "id": "ch06-048",
+    "chapter": 6,
+    "section": "6.7 Meta CacheLib (OSDI 2020) and flash caching",
+    "title": "Senior lens: flash caches change the cost curve",
+    "body": "Flash caches change the cost curve of caching. When the working set is 10 times bigger than affordable DRAM, a DRAM-only cache has a poor hit ratio, and the backend database pays for all those misses. A DRAM plus flash cache can hold the long tail instead. The costs are flash endurance, which must be controlled through admission policies that limit write rate, and slightly higher latency for hits served from flash rather than DRAM.",
+    "deeper": "The key question a senior reviewer asks is: how big is the working set relative to what DRAM we can afford? If the hot set fits comfortably in DRAM, flash adds complexity for little gain. If the working set is much larger, which the CacheLib measurements suggest is common because real popularity is less skewed and changes quickly, then DRAM-only caching leaves a big hit-ratio gap that shows up as database load.\n\nThe sizing math makes this concrete. Database load equals read rate times one minus hit ratio, so small gains in hit ratio remove large amounts of database work. In the chapter's example, every 1 percent of hit ratio gained removes 20,000 database reads per second at peak, and the full 1 billion profile set of about 1.1 TB could fit in a few flash-backed servers.\n\nThe costs are manageable when designed for: pick an admission probability matching device endurance, and accept that a flash hit is slower than DRAM but still far faster than a database read.",
+    "quiz": {
+      "q": "When does a DRAM plus flash cache beat a DRAM-only cache, and what does it cost?",
+      "a": "When the working set far exceeds affordable DRAM, flash holds the long tail and raises hit ratio. Costs: flash endurance (limit writes via admission) and slightly slower flash hits."
+    }
+  },
+  {
+    "id": "ch06-049",
+    "chapter": 6,
+    "section": "6.8 Netflix EVCache: cross-region replication",
+    "title": "EVCache: memcached for AWS, a full copy per zone",
+    "body": "EVCache, short for Ephemeral Volatile Cache, is Netflix's distributed cache built on memcached and designed for AWS. Clients use consistent hashing (the Ketama algorithm) to spread keys across servers. A typical setup keeps a full copy of the data in each availability zone. Reads go to the local zone, which keeps latency low. Writes go to all zones. If an item is missing locally, because of an instance failure or eviction, the client can read it from another zone.",
+    "deeper": "The per-zone copy design addresses several of the chapter's problems at once. Latency: reads stay inside the zone, avoiding cross-zone network hops. Availability: losing a cache instance or even a whole zone does not mean a cold cache, since other zones still hold the data and the client can fall back to them. Hot keys: because every zone has a copy, reads for a popular key are naturally spread across zones.\n\nThe cost is memory and write fan-out. Every item is stored once per zone, and every write or delete must reach every zone. The sizing section's example uses the same shape: one copy per zone in three zones triples the memory needed, from about 220 GB to about 660 GB.\n\nPutting the replication logic in the client keeps the servers as plain memcached. The client handles hashing, zone selection, writing to all zones, and fallback reads. That same client is also where Netflix hooks in cross-region replication, publishing metadata events so other regions' caches stay warm.",
+    "quiz": {
+      "q": "Why does EVCache keep a full copy of the data in each availability zone?",
+      "a": "So reads stay local and fast, a missing item can be read from another zone after failure or eviction, and zone loss doesn't leave a cold cache."
+    }
+  },
+  {
+    "id": "ch06-050",
+    "chapter": 6,
+    "section": "6.8 Netflix EVCache: cross-region replication",
+    "title": "EVCache's cross-region pipeline: ship keys, not values",
+    "body": "Netflix runs active in several AWS regions and can move all traffic out of a failing region. If the target region's caches were cold, the sudden traffic would crush its databases, so EVCache replicates across regions. The app writes to its local EVCache. The client publishes a small metadata event, the key but not the value, to Kafka. A replication reader consumes it, reads the latest value from local EVCache, and sends it to a replication writer in the other region, which writes it there.",
+    "deeper": "Sending only metadata through Kafka keeps the pipeline small: keys are tiny compared to values, so Kafka carries far less data. There is also a correctness benefit. Because the reader fetches the value from local EVCache when it processes the event, it always replicates the newest value, not whatever was current when the event was published. If a key is written several times quickly, each event results in shipping the latest state.\n\nThe scale reported in 2024 shows why efficiency matters: about 200 memcached clusters, 22,000 server instances, 400 million operations per second, 30 million replication events globally, and about 2 trillion items totaling 14.3 PB.\n\nThe pipeline covers both sets and deletes, so the remote region's cache tracks the local one. Uber's CacheFront takes a similar approach for failover, replicating Redis writes so the remote region has a warm cache. The chapter's quiz asks exactly this: EVCache sends only metadata (the key and operation) because it keeps messages small and always replicates the newest value.",
+    "quiz": {
+      "q": "What does EVCache send through Kafka for cross-region replication, and why not the value itself?",
+      "a": "Only metadata (key and operation). The reader fetches the latest value from local EVCache, keeping Kafka messages small and always replicating the newest value."
+    }
+  },
+  {
+    "id": "ch06-051",
+    "chapter": 6,
+    "section": "6.8 Netflix EVCache: cross-region replication",
+    "title": "Netflix: the warm cache is part of disaster recovery",
+    "body": "Netflix's approach treats the cache as part of its disaster-recovery plan. When a region fails, Netflix moves all its traffic to other regions. The caches in the failover region are kept warm on purpose through cross-region replication, because a cold cache during failover would turn a regional outage into a global database overload. The failover region must absorb extra traffic, and a warm cache ensures that extra traffic mostly hits memory instead of landing on the databases.",
+    "deeper": "This is the load-bearing cache idea taken to its logical end. A region's databases are sized for that region's normal miss traffic. During failover, the surviving region suddenly serves users from the failed region too. If those users' data is not in the local cache, every one of their reads misses, and the combined miss rate can far exceed what the databases can take. The outage would spread from one region to all of them.\n\nKeeping caches warm across regions costs continuous replication traffic and memory in every region, whether or not a failover ever happens. Netflix pays that cost because failover must actually work when it is needed.\n\nThe key takeaways generalize the lesson: warm caches are part of disaster recovery, and both Netflix EVCache and Uber CacheFront replicate caches across regions for failover. The failure-mode section lists cross-region replication among the mitigations for cold caches, alongside slow rolling restarts, CacheLib warm restarts and Meta's cold cluster warmup.",
+    "quiz": {
+      "q": "Why would a cold cache in the failover region risk turning a regional outage into a global one?",
+      "a": "Redirected traffic would all miss and hit the surviving region's databases, overloading them and spreading the failure beyond the original region."
+    }
+  },
+  {
+    "id": "ch06-052",
+    "chapter": 6,
+    "section": "6.9 Twitter/X: Twemcache and Pelikan",
+    "title": "Twemcache: Twitter's operational fork of memcached",
+    "body": "Twitter ran large memcached fleets and forked memcached 1.4.4 into Twemcache. The changes were mainly operational. It added pluggable eviction strategies: item LRU, random eviction, and slab-level eviction to handle slab calcification, where memory stays stuck in size classes that no longer match the workload. It also added lock-free stats and a lockless command logger for debugging. Twemcache was retired in 2021 in favor of Pelikan, Twitter's newer cache framework.",
+    "deeper": "Slab calcification needs a little background. Memcached allocates memory in slabs divided into fixed size classes, and items go into the class that fits them. If the workload's item sizes shift over time, memory already assigned to old size classes can remain there even though new items need a different class. The cache is effectively smaller than its memory, and hit ratio suffers. Slab-level eviction frees whole slabs so memory can move to the size classes that need it now.\n\nThe other changes target running caches at scale. Lock-free statistics let operators observe the cache without adding contention on hot paths. A lockless command logger allows capturing what commands a server is receiving to debug problems in production without slowing it down.\n\nThe theme is consistent with the chapter's senior lens on Twitter: at scale, a cache's memory efficiency and operational behavior matter as much as raw speed. Pelikan and its Segcache engine continued that line of work.",
+    "quiz": {
+      "q": "What is slab calcification, and how did Twemcache handle it?",
+      "a": "Memory stays stuck in slab size classes that no longer match the workload's item sizes. Twemcache added slab-level eviction to free and reuse that memory."
+    }
+  },
+  {
+    "id": "ch06-053",
+    "chapter": 6,
+    "section": "6.9 Twitter/X: Twemcache and Pelikan",
+    "title": "Pelikan and Segcache: expire by the segment, not the item",
+    "body": "Pelikan is Twitter's framework for building cache servers from shared, reusable parts, now written in Rust. It separates control plane and data plane at runtime and uses lockless data structures so worker threads never block. Its Segcache storage engine (NSDI 2021) groups objects with similar expiry times into segments, so expired data is removed in bulk. Segcache used 22 to 60 percent less memory than state-of-the-art designs on tested workloads and scaled to close to 8 times memcached's throughput at 24 threads.",
+    "deeper": "Why does grouping by expiry help? In a typical cache, items with different TTLs are mixed together, so expired items linger in memory until something happens to look at them, and removing them one by one is costly. Segcache places objects with similar expiry times into the same segment. When a segment's time comes, the whole segment is dropped at once, reclaiming memory promptly and cheaply.\n\nThe memory savings, 22 to 60 percent less than state-of-the-art designs on the tested workloads, come partly from this prompt expiration and from reducing per-object overhead for small objects, the engine's focus.\n\nThe throughput result, close to 8 times memcached at 24 threads, reflects Pelikan's design goal that worker threads never block, using lockless data structures and keeping control-plane work off the data path.\n\nThe framework approach echoes CacheLib's motivation at Meta: build cache servers from shared, reusable parts instead of every team starting from scratch. Pelikan replaced Twemcache at Twitter in 2021.",
+    "quiz": {
+      "q": "How does Segcache reclaim expired data more efficiently than per-item expiry?",
+      "a": "It groups objects with similar expiry times into segments and removes whole segments at once when they expire, instead of finding and deleting items individually."
+    }
+  },
+  {
+    "id": "ch06-054",
+    "chapter": 6,
+    "section": "6.9 Twitter/X: Twemcache and Pelikan",
+    "title": "Senior lens: 50 bytes per item is terabytes at trillions",
+    "body": "Twitter's lesson is that at scale, a cache's memory efficiency and TTL handling matter as much as raw speed. Per-object metadata overhead of 50 bytes is nothing for one item, but across trillions of items it becomes many terabytes of RAM. That is memory you pay for without caching any data. Designs that shave metadata per item, and that reclaim expired items promptly, can let the same hardware hold far more of the working set.",
+    "deeper": "Run the numbers in the spirit of the chapter: one trillion items times 50 bytes of metadata each is 50 TB of RAM spent purely on bookkeeping. Netflix's EVCache alone held about 2 trillion items in 2024, so the scale is real.\n\nMemory efficiency converts directly into hit ratio. With the same DRAM, a leaner engine holds more items, which raises the hit ratio, which lowers database load. And the sizing section shows how leveraged that is: in the running example each 1 percent of hit ratio is 20,000 database reads per second at peak.\n\nTTL handling matters for the same reason. Expired items that sit in memory until evicted are dead weight; an engine like Segcache that removes them in bulk frees memory for live data. Small objects make overhead proportionally worse, which is why both Segcache and CacheLib's Small Object Cache focus on them. The sizing example itself assumes about 100 bytes of cache overhead on each 1 KB profile, roughly 10 percent.",
+    "quiz": {
+      "q": "Why does per-object metadata overhead matter so much in very large caches?",
+      "a": "Small overhead multiplied by trillions of items consumes terabytes of RAM that could hold data, lowering hit ratio and raising backend load."
+    }
+  },
+  {
+    "id": "ch06-055",
+    "chapter": 6,
+    "section": "6.10 Uber CacheFront: a cache inside the database",
+    "title": "Uber CacheFront: the database query engine owns the cache",
+    "body": "Instead of every team building its own look-aside logic, Uber put the cache inside Docstore's query engine. This is CacheFront (2024). On reads, the query engine checks Redis first, returns cached rows, fetches the rest from the storage engine, and fills Redis asynchronously. For invalidation, Flux tails the MySQL binlog and invalidates or updates Redis within seconds, and the write path also invalidates directly so reads are fresh sooner. Applications just query Docstore and get caching automatically.",
+    "deeper": "CacheFront is a read-through cache in the chapter's pattern table: the cache layer, not the application, fills on a miss. Placing it in the query engine means every Docstore user gets the same well-tested behavior.\n\nThe read path handles partial hits naturally. A query for several rows returns the cached ones from Redis and fetches only the missing rows from storage. Filling Redis asynchronously keeps the fill off the request's critical path.\n\nInvalidation uses two channels. The direct invalidation from the write path gives fast freshness in the normal case. Flux, tailing the binlog, is the reliable backstop: because the binlog is durable and ordered, a crashed write path cannot cause a lost invalidation. This mirrors Meta's McSqueal, which also invalidates from the commit log.\n\nOn top of that, CacheFront guards against stale fills with timestamp checks, caches missing rows, shards Redis independently of the database, and replicates to other regions, each covered on the following cards.",
+    "quiz": {
+      "q": "Why does CacheFront invalidate both from the write path and from Flux tailing the binlog?",
+      "a": "Direct invalidation gives fresh reads quickly; the binlog-driven Flux is durable and ordered, so invalidations are never lost if the write path fails."
+    }
+  },
+  {
+    "id": "ch06-056",
+    "chapter": 6,
+    "section": "6.10 Uber CacheFront: a cache inside the database",
+    "title": "Timestamp guards and negative caching in CacheFront",
+    "body": "CacheFront adds two protections on top of basic caching. Stale-fill protection: Lua scripts in Redis compare row timestamps so older data can never overwrite newer data, closing the late-fill race where a slow reader writes old values after a fresher update. Negative caching: rows that do not exist are cached with a flag marking them as missing, so repeated lookups for keys that are absent do not each hit MySQL. Both reduce database load and stale reads without any application code.",
+    "deeper": "The timestamp check is Uber's answer to the stale-set race that Meta solved with leases. Instead of tokens, each cached row carries its timestamp, and a Lua script, which runs atomically inside Redis, only writes the incoming row if it is newer than what is already there. A delayed asynchronous fill or a lagging source cannot resurrect old data.\n\nNegative caching targets a subtle load source. Without it, a lookup for a row that does not exist always misses, because there is nothing to cache, and always goes to the database. If many requests look up missing rows repeatedly, perhaps due to a client bug or a common probe pattern, the database takes that load in full no matter how high the hit ratio is for existing rows. Caching the absence with a flag turns those into cache hits.\n\nNegative entries must also be invalidated when the row is later created, which the binlog-driven Flux path covers, since row creation is a committed write.",
+    "quiz": {
+      "q": "What problem does negative caching solve in CacheFront?",
+      "a": "Lookups for rows that don't exist would always miss and hit MySQL; caching a 'missing' flag lets repeated lookups for absent keys be served from Redis."
+    }
+  },
+  {
+    "id": "ch06-057",
+    "chapter": 6,
+    "section": "6.10 Uber CacheFront: a cache inside the database",
+    "title": "Shard the cache apart from the database, warm it across regions",
+    "body": "CacheFront shards Redis by partition key, independently of how the database is sharded. If one Redis cluster fails, its misses spread across all database shards instead of hammering one. CacheFront also replicates Redis writes to a remote region, so that region has a warm cache ready for failover, the same idea as Netflix EVCache. Both choices are about making cache failures survivable: a single cache failure should not overload one database shard, and a region failover should not start cold.",
+    "deeper": "The sharding choice is subtle. If Redis clusters mapped one-to-one onto database shards, a Redis cluster failure would send its entire miss load to exactly one database shard, which is sized for only its normal miss traffic. By sharding independently, each Redis cluster holds keys from many database shards, so its failure spreads a modest increase across all of them. The blast radius per database shard stays small.\n\nThis is a concrete answer to the senior staff question from the start of the chapter: if this cache were empty, could the database survive? For a single cluster failure, spreading misses makes the answer yes more often.\n\nCross-region warming handles the larger failure: losing a region. Like EVCache, replicating cache writes means the failover region's Redis already holds the data users from the failed region will request. The key takeaways put Netflix and Uber together on this point: warm caches are part of disaster recovery.",
+    "quiz": {
+      "q": "Why does CacheFront shard Redis independently of database sharding?",
+      "a": "So a failed Redis cluster's misses spread across all database shards rather than overloading the one shard it would otherwise mirror."
+    }
+  },
+  {
+    "id": "ch06-058",
+    "chapter": 6,
+    "section": "6.10 Uber CacheFront: a cache inside the database",
+    "title": "CacheFront results: 40M reads/sec, 99.99% consistency",
+    "body": "Uber reported CacheFront's results in 2024: over 40 million reads per second across instances, cache hit rates up to 99 percent in production cases, p75 latency down 75 percent, p99.9 latency down more than 67 percent, and consistency measured at 99.99 percent. CacheFront illustrates the integrated-cache trend: when the database platform owns the cache, invalidation comes from the commit log, every team gets caching for free, and application code cannot forget to delete a key.",
+    "deeper": "Each number maps to a design choice. The hit rate up to 99 percent reflects caching done centrally with negative caching, so even missing rows hit. The latency drops, 75 percent at p75 and more than 67 percent at p99.9, show the tail improving along with the median, as expected when most reads move from storage to memory. The 99.99 percent consistency figure reflects the layered defenses: direct invalidation, binlog-driven Flux, and Lua timestamp checks against stale fills.\n\nOne CacheFront use case also produced the chapter's cost example: 6 million reads per second on about 3,000 Redis cores versus an estimated 60,000 database cores.\n\nThe integrated-cache trend addresses the organizational weakness of look-aside caching. When every team implements its own cache logic, some team will eventually forget a delete, skip the TTL or mishandle a race. Meta's TAO took a similar route for the social graph. Moving the cache into the data platform turns correctness into a platform property instead of a per-team discipline.",
+    "quiz": {
+      "q": "What is the main advantage of an integrated cache like CacheFront over per-team look-aside caches?",
+      "a": "The platform owns invalidation from the commit log and all protections, so every team gets correct caching for free and no application can forget to delete a key."
+    }
+  },
+  {
+    "id": "ch06-059",
+    "chapter": 6,
+    "section": "6.11 Redis and Valkey at scale",
+    "title": "Redis and Valkey: data structures in memory",
+    "body": "Redis is an in-memory data-structure server. Beyond plain strings it supports hashes, lists, sets, sorted sets and streams. That makes it popular both as a cache and as a small primary store, for things like leaderboards, rate limiters and sessions. In 2024 the Linux Foundation community forked Redis as Valkey, which keeps compatibility with the Redis protocol and cluster design. Everything about clustering and persistence in this section applies to both.",
+    "deeper": "The data-structure model is what separates Redis from memcached's plain get, set and delete. A sorted set can keep a leaderboard ordered by score, a counter can be incremented atomically for rate limiting, and a hash can store a session's fields. Server-side scripts in Lua can run atomically, which is how Uber's CacheFront implements its timestamp comparisons to block stale fills.\n\nUsing Redis as a primary store is where care is needed. Its replication is asynchronous and its persistence modes can lose recent writes, so the chapter's common mistake box warns against treating it as a durable database just because persistence is on. The safe uses are data you can lose or rebuild.\n\nValkey's compatibility means existing clients and cluster setups keep working. At large scale, Redis-style caches are proven: Uber's CacheFront serves over 40 million reads per second backed by Redis. The next cards cover cluster mode (hash slots, redirection, replicas) and the persistence options.",
+    "quiz": {
+      "q": "What makes Redis more than a plain key-value cache, and what are common non-cache uses?",
+      "a": "It stores data structures like hashes, lists, sets, sorted sets and streams, so it is used as a small primary store for leaderboards, rate limiters and sessions."
+    }
+  },
+  {
+    "id": "ch06-060",
+    "chapter": 6,
+    "section": "6.11 Redis and Valkey at scale",
+    "title": "16,384 hash slots and the {hash tag} trick",
+    "body": "Redis and Valkey cluster mode split the key space into 16,384 hash slots. A key's slot is CRC16(key) mod 16384, and each primary node owns some slots. Moving data between nodes means moving slots. Hash tags control placement: if a key contains braces, only the part inside the braces is hashed. So {user1000}.followers and {user1000}.following land in the same slot, on the same node, and can be used together in one multi-key operation.",
+    "deeper": "Why slots instead of hashing keys directly to nodes? Slots add a fixed layer of indirection. The key-to-slot mapping never changes, since it is just CRC16 mod 16384. Only the slot-to-node mapping changes when nodes are added or removed, so rebalancing moves whole slots rather than recomputing every key's home.\n\nMulti-key operations need all keys on the same node, because a single node executes the command. Without hash tags, related keys would scatter across the cluster by their full names and could not be used in one operation. Hash tags let the application group related keys deliberately: everything about user1000 shares a slot.\n\nThe flip side is that hash tags can create hotspots. Everything with the same tag lives in one slot on one node, so grouping too much under one tag, or tagging a very popular entity, recreates the hot-key problem from earlier in the chapter, which sharding cannot fix. Use tags for keys that genuinely need to be operated on together.",
+    "quiz": {
+      "q": "Why would you put {user1000} in braces in Redis Cluster keys?",
+      "a": "Only the braced part is hashed, so all keys with that tag land in the same slot and node, enabling multi-key operations on them."
+    }
+  },
+  {
+    "id": "ch06-061",
+    "chapter": 6,
+    "section": "6.11 Redis and Valkey at scale",
+    "title": "MOVED vs ASK: how Redis clients follow slots around",
+    "body": "Redis Cluster clients cache the slot map, knowing which node owns each slot, so they can send requests directly to the right node. When the map is out of date, the node replies with a redirect. A MOVED reply means the slot has moved permanently to another node: the client should update its cached map. An ASK reply means the slot is currently migrating: the client should try the other node for just this request, without updating its map.",
+    "deeper": "The distinction exists because slot migration is gradual. While a slot moves from node A to node B, some of its keys are already on B and some are still on A. A request for a key that has already moved gets ASK: go to B for this one. The client should not rewrite its map yet, because other keys of that slot may still be on A. Once migration finishes, the cluster reassigns the slot, and requests to A get MOVED, telling the client to update its map permanently.\n\nClient-side slot maps avoid a proxy hop on every request, similar to how Meta's clients hash keys to servers and EVCache clients use Ketama consistent hashing. The cost is that clients must handle redirects correctly. A client that treated ASK like MOVED would redirect all of a slot's keys to B too early, and one that ignored MOVED would keep paying an extra hop on every request.",
+    "quiz": {
+      "q": "What is the difference between a MOVED and an ASK reply in Redis Cluster?",
+      "a": "MOVED: the slot moved permanently, so update the cached slot map. ASK: the slot is migrating, so try the other node for this request only, without updating the map."
+    }
+  },
+  {
+    "id": "ch06-062",
+    "chapter": 6,
+    "section": "6.11 Redis and Valkey at scale",
+    "title": "Async replication: Redis can lose acknowledged writes",
+    "body": "Each Redis Cluster primary has replicas, but replication is asynchronous. The primary acknowledges a write to the client before replicas have received it. If the primary then fails and a replica is promoted, that write may never have reached the replica, so it is gone even though the client was told it succeeded. The cluster can also lose acknowledged writes on the minority side of a network partition. Redis Cluster does not guarantee acknowledged writes survive failover.",
+    "deeper": "Asynchronous replication is a latency choice. Waiting for replicas before acknowledging would add a network round trip to every write, and Redis is built for speed. For a pure cache, losing a few recent writes during failover is harmless: the data can be read again from the source of truth.\n\nThe partition case is less obvious. If a network split leaves a primary on the minority side, clients connected to it may keep writing for a while. When the majority promotes a replica on its side, the minority primary's writes during the split are discarded.\n\nThe chapter's quiz frames it directly: a primary acknowledges a write and fails before replicating it. The write can be lost, because replication is asynchronous, the promoted replica may not have it, and the cluster does not guarantee survival of acknowledged writes. Combined with persistence settings like fsync every second, this is why the chapter warns against treating Redis as a strongly durable database.",
+    "quiz": {
+      "q": "A Redis Cluster primary acknowledges a write, then fails before replicating it. What happens to the write, and why?",
+      "a": "It can be lost. Replication is asynchronous, so the promoted replica may never have received it; the cluster doesn't guarantee acknowledged writes survive failover."
+    }
+  },
+  {
+    "id": "ch06-063",
+    "chapter": 6,
+    "section": "6.11 Redis and Valkey at scale",
+    "title": "RDB vs AOF: how much can Redis forget on restart?",
+    "body": "Redis offers several persistence modes. RDB snapshots are periodic point-in-time dumps made using fork(): compact and fast to restart from, but you can lose minutes of writes, and fork() on a big dataset can pause the server briefly. AOF, the append-only file, logs every write: with the default fsync every second, you can lose about one second of writes, while fsync always is very safe and very slow. You can combine RDB plus AOF, or use no persistence, common for pure caches.",
+    "deeper": "The modes trade restart speed, write overhead and data loss. RDB writes a full snapshot occasionally, so it is cheap during normal operation and gives a compact file that loads quickly, but everything since the last snapshot is lost on a crash. The fork() pause matters for latency-sensitive services with large datasets.\n\nAOF records each write, so the loss window shrinks to the fsync interval. The default of once per second bounds loss to about a second; fsync on every write makes each write wait for the disk, which removes most of Redis's speed advantage. Combining RDB and AOF gets a compact restart point plus a small loss window.\n\nFor a pure cache, persistence is often turned off entirely: the source of truth has the data, and a restart simply starts cold. Where restarts must not start cold, the chapter points to other mitigations like warm restarts, peer warmup and cross-region replication. And persistence on a single node does not fix the asynchronous replication loss during failover.",
+    "quiz": {
+      "q": "What is the durability trade-off between RDB snapshots and AOF with fsync every second?",
+      "a": "RDB is compact and quick to restart but can lose minutes of writes; AOF with fsync each second logs every write and loses only about one second."
+    }
+  },
+  {
+    "id": "ch06-064",
+    "chapter": 6,
+    "section": "6.11 Redis and Valkey at scale",
+    "title": "Common mistake: 'persistence is on, so Redis is durable'",
+    "body": "A common mistake is treating Redis as a durable database because persistence is turned on. Persistence does not close the gaps: replication is asynchronous, and the default AOF setting fsyncs only every second, so a failover can lose recent acknowledged writes. Use Redis as a primary store only for data you can lose or rebuild, such as rate limiter counts, leaderboards you can recompute or sessions users can recreate. Otherwise use a managed variant with a durable log, and read the fine print.",
+    "deeper": "The mistake comes from conflating two different durability questions. Persistence answers: if this node restarts, how much of its data comes back? Replication answers: if this node dies, does another node have everything it acknowledged? Redis persistence handles the first partially and does not address the second at all. A write acknowledged by a primary that fails before replicating it is lost regardless of the primary's AOF, because the replica that gets promoted never saw it.\n\nThis matters because Redis is so convenient as a primary store for small data. It is fine when losing a second or two of writes, or rebuilding the data, is acceptable. It is dangerous for data of record: account balances, orders, or anything a user expects to survive once confirmed.\n\nThe key takeaways restate it: Redis/Valkey Cluster uses 16,384 hash slots and asynchronous replication, and persistence does not make it a strongly durable database. Managed variants with a durable log can change the picture, but only if their guarantees are verified.",
+    "quiz": {
+      "q": "Why doesn't turning on persistence make Redis a strongly durable database?",
+      "a": "Replication is asynchronous and AOF defaults to fsync every second, so a failover or crash can still lose recently acknowledged writes."
+    }
+  },
+  {
+    "id": "ch06-065",
+    "chapter": 6,
+    "section": "6.12 The CDN: the outermost cache",
+    "title": "The CDN: the biggest cache sits next to the user",
+    "body": "For large blobs like images, video and JavaScript, the biggest cache is not near the database but near the user. A content delivery network (CDN) is a set of cache servers in many cities and inside internet providers. Akamai and Cloudflare sell this as a service, while Meta runs its own edge caches. Meta's CDN caches serve 70 percent of web requests and cut latency by an order of magnitude, according to the CacheLib paper (2020).",
+    "deeper": "A CDN is the outermost caching tier. Where database caches save CPU and database load, a CDN mainly saves distance and bandwidth: a user fetching an image from a server in their own city, or even inside their own internet provider's network, gets it far faster than from a distant data center, and the long-haul network carries far less traffic.\n\nThis is where the book's blob storage chapters meet this chapter's caches. The origin, an object store, holds everything durably. The CDN serves the popular part near users. It is the same source-of-truth-plus-disposable-copy relationship as a database and memcache, just at a different layer.\n\nMeta's CDN edge caches are among the systems built on CacheLib, which is why the CacheLib paper reports their numbers. And the CDN workload was one of those it measured as having less skew than textbook Zipf, around alpha 0.55, with popularity changing over hours, pushing toward larger caches that include flash.",
+    "quiz": {
+      "q": "How does a CDN relate to blob storage and the idea of a cache?",
+      "a": "The object store is the origin and source of truth holding everything; the CDN is a disposable copy of the popular part, served from servers near users."
+    }
+  },
+  {
+    "id": "ch06-066",
+    "chapter": 6,
+    "section": "6.12 The CDN: the outermost cache",
+    "title": "Netflix Open Connect: fill the cache before anyone asks",
+    "body": "Netflix built its own CDN, Open Connect. It places Open Connect Appliances in its own 60+ data centers and, for free, inside more than a thousand partner ISPs. Because Netflix knows in advance what people are likely to watch, it fills these appliances with content during off-peak hours, called nightly fills. This is proactive caching: the cache is filled before any request arrives, which is only possible when the catalog is known and changes slowly.",
+    "deeper": "Most caches in this chapter are demand-filled: data enters the cache when someone misses on it. Open Connect inverts that. The catalog is finite and known, and viewing patterns are predictable enough to decide ahead of time which titles each location will need. Loading them overnight uses network capacity when it is otherwise idle and means peak-hour viewing is served almost entirely from nearby appliances.\n\nPlacing appliances inside ISPs for free benefits both sides: the ISP carries less traffic across its external links, and Netflix gets its content as close to viewers as possible.\n\nThe chapter is explicit about when this works: only when the catalog is known and changes slowly. A social feed, where new posts appear every second and popularity shifts within hours, cannot be filled ahead of time in the same way. Proactive filling also shares a theme with Netflix's EVCache cross-region replication: in both cases Netflix deliberately fills caches before traffic needs them, so the cache is warm at the critical moment.",
+    "quiz": {
+      "q": "Why can Netflix fill Open Connect appliances before anyone requests the content, when most caches can't?",
+      "a": "Its catalog is known and changes slowly, and viewing is predictable, so it can load likely titles during off-peak nightly fills. Fast-changing data can't be pre-filled."
+    }
+  },
+  {
+    "id": "ch06-067",
+    "chapter": 6,
+    "section": "6.13 Sizing and hit-ratio math",
+    "title": "Miss rate, not hit rate: 99% to 95% means 5x DB load",
+    "body": "Database load equals read rate times one minus the hit ratio, so the miss rate is what matters. Using illustrative numbers: peak of 2 million profile reads per second, with a database tier that safely handles 100,000. At 99 percent hit ratio, 20,000 reads per second reach the database. At 98 percent, 40,000, double. At 95 percent, 100,000, five times the load and at the limit. At 90 percent, 200,000, ten times: overload. A small-sounding drop is a database outage.",
+    "deeper": "The intuition trap is that 99 and 95 sound almost the same. Flip it to misses: 1 percent versus 5 percent is a factor of five. That is why a cache with a 99 percent hit rate is load-bearing: a partial failure that drops it to 95 percent is a database outage in this example.\n\nThe chapter's quiz makes the same point with a smaller drop: a hit ratio falling from 99 to 97 percent after a deploy means misses go from 1 percent to 3 percent of reads, so database read load triples.\n\nThe same math drives the value of improvements. Every 1 percent of hit ratio gained removes 20,000 database reads per second at peak in this example. That is what justifies spending on larger caches, flash tiers and warmup machinery.\n\nIt also explains the failure cascade diagram: cache nodes restart or fail, the hit ratio drops from say 99 to 90, database load rises 10 times, latency and timeouts rise, clients retry, and more load follows. Every mitigation in the chapter attacks one link in that chain.",
+    "quiz": {
+      "q": "Your cache hit ratio drops from 99 to 97 percent after a deploy. By how much does database read load change?",
+      "a": "It triples: misses go from 1 percent to 3 percent of reads."
+    }
+  },
+  {
+    "id": "ch06-068",
+    "chapter": 6,
+    "section": "6.13 Sizing and hit-ratio math",
+    "title": "Sizing a cache: memory says 11 servers, throughput says 15/zone",
+    "body": "Size a cache by both memory and throughput, and take the larger. Illustrative example: 200 million daily active users, each cached profile about 1 KB plus 100 bytes of overhead. The hot set is about 220 GB; one copy per zone in three zones is about 660 GB, roughly 11 servers with 64 GB usable each. But if one server handles 200,000 gets per second, 2 million reads per second per zone copy needs at least 10 servers per zone, perhaps 15 with failure headroom.",
+    "deeper": "Walk through the memory side: 200 million users times 1.1 KB is about 220 GB for one copy. The per-zone replication, as in EVCache, triples it to about 660 GB. Dividing by 64 GB usable per server gives about 11 servers' worth of memory in total.\n\nNow throughput: each zone's copy must serve that zone's reads, and the example assumes 2 million reads per second per zone copy. At 200,000 gets per second per server, that is 10 servers per zone minimum. Adding headroom so the cache survives server failures without a hit-ratio collapse brings it to perhaps 15 per zone.\n\nIn this example the two methods give similar answers; the chapter's rule is that when they differ, you size for the larger. A memory-only estimate can badly undersize a high-QPS cache of small items, and a throughput-only estimate can undersize a cache of large items. The 100 bytes per item of overhead is worth noting too: at about 10 percent of each profile, it is the kind of per-object cost Twitter's senior lens warns about.",
+    "quiz": {
+      "q": "When memory-based and throughput-based cache sizing give different server counts, which should you use and why?",
+      "a": "The larger one: the cache must both hold the hot set and serve the peak request rate with failure headroom, and falling short on either hurts hit ratio or latency."
+    }
+  },
+  {
+    "id": "ch06-069",
+    "chapter": 6,
+    "section": "6.13 Sizing and hit-ratio math",
+    "title": "Is flash worth it? Each 1% of hit ratio = 20,000 DB reads/sec",
+    "body": "In the running example, the full profile set is 1 billion users times 1.1 KB, about 1.1 TB. That is too much for DRAM economically, but it could fit in a few flash-backed servers. Then the long tail of rarely active users, beyond the 200 million daily actives, can hit flash instead of the database. The payoff is concrete: every 1 percent of hit ratio gained removes 20,000 database reads per second at peak in this example.",
+    "deeper": "This ties the sizing math to the CacheLib section. A DRAM cache holds the daily-active hot set of about 220 GB per copy. Requests for the other 800 million users' profiles miss and go to the database. Those users are individually rare but collectively significant, exactly the long tail that the CacheLib paper found in real workloads with less skewed popularity than textbook Zipf.\n\nFlash changes the cost of holding that tail: it offers many times more capacity per dollar than DRAM with sub-millisecond reads. Holding all 1.1 TB on a few flash-backed servers converts tail misses into flash hits.\n\nBecause database load equals read rate times one minus hit ratio, the gain is large in absolute terms: each percent of hit ratio is 20,000 reads per second at a 2 million read peak, and the database's safe limit in the example is 100,000. The costs to weigh are flash endurance, managed with admission policies, and slightly higher latency for flash hits compared with DRAM.",
+    "quiz": {
+      "q": "In the running example, why can a flash tier meaningfully reduce database load even though daily actives already fit in DRAM?",
+      "a": "The rarely active long tail misses a DRAM cache; holding the full 1.1 TB on flash turns those misses into hits, and each 1 percent of hit ratio saves 20,000 DB reads/sec."
+    }
+  },
+  {
+    "id": "ch06-070",
+    "chapter": 6,
+    "section": "6.14 Failure modes",
+    "title": "Cold caches: restarting many nodes at once floods the DB",
+    "body": "A restarted memcached node comes back empty. Restart many at once, for example during a fleet-wide deploy, and the database sees a surge of misses it may not survive. This is the cold cache failure mode. Mitigations from across the chapter: roll restarts slowly so only a small fraction of the cache is cold at a time, use warm restarts (CacheLib), warm a new cluster from a warm peer (Meta's Cold Cluster Warmup), and replicate across regions (EVCache, CacheFront).",
+    "deeper": "The hit-ratio math shows why cold caches are dangerous. If the cache normally runs at 99 percent and a deploy empties a tenth of it, the effective hit ratio can drop toward 90 percent, a tenfold increase in database load in the chapter's example, far past its limit.\n\nEach mitigation attacks a different cause. Slow rolling restarts limit how much of the cache is cold at any moment, trading deploy speed for safety. Warm restarts avoid emptying the cache at all by saving and reattaching state. Cold Cluster Warmup handles brand-new clusters by reading misses from a warm peer, bringing capacity up in hours instead of days. Cross-region replication handles the largest case: a whole region's traffic moving elsewhere.\n\nBecause production caches restart frequently, with many production caches running less than 7 days between restarts, this is not a rare event. It is a routine operation that must be designed so it never looks like an outage to the database.",
+    "quiz": {
+      "q": "Why is restarting many cache nodes at once dangerous, and name two mitigations?",
+      "a": "Restarted nodes are empty, so hit ratio drops and misses surge onto the database. Mitigations: slow rolling restarts, warm restarts, warm-peer cluster warmup, cross-region replication."
+    }
+  },
+  {
+    "id": "ch06-071",
+    "chapter": 6,
+    "section": "6.14 Failure modes",
+    "title": "DynamoDB's trick: keep the backend busy even on cache hits",
+    "body": "The DynamoDB paper warns not to let caches hide work the system must be able to do without them. DynamoDB's request routers cache partition metadata locally, but even on a cache hit they send an asynchronous refresh call to the MemDS metadata fleet. So MemDS always serves a constant volume of traffic regardless of hit ratio. This costs extra load in normal times, but prevents cascading failures when caches become ineffective, because MemDS was never sized for a hit ratio.",
+    "deeper": "This is the cache as hidden capacity dependency failure mode, and DynamoDB's answer is unusual: deliberately give up the offload benefit to keep the backend honest. Normally a high hit ratio lets the backend fleet shrink. Then, if caches suddenly become ineffective, say after a mass restart or a change in access pattern, the backend sees a load spike it was never provisioned for, and fails. Because the routers' refresh calls go out whether or not they hit, MemDS load never depends on the hit ratio, so there is no spike to survive.\n\nThe general guidance from the chapter: keep the database able to survive a realistic miss storm, or add admission control and load shedding in front of it so overload is refused gracefully rather than cascading.\n\nThis connects back to the opening senior staff lens: if the cache were empty right now, could the database survive? DynamoDB engineered the metadata path so the answer is always yes, at the cost of constant extra work.",
+    "quiz": {
+      "q": "Why do DynamoDB's request routers send refresh calls to MemDS even on cache hits?",
+      "a": "So MemDS serves constant traffic regardless of hit ratio and is always sized for it; if caches become ineffective, there is no sudden load spike to cause cascading failures."
+    }
+  },
+  {
+    "id": "ch06-072",
+    "chapter": 6,
+    "section": "6.14 Failure modes",
+    "title": "Failure rehashing: one dead node, then the next, then the next",
+    "body": "When a cache node dies in a consistent-hashing cluster, its keys are typically rehashed onto the surviving nodes. That sounds harmless, but load per key is uneven. If the dead node held a hot key, the node inheriting it receives a sudden surge on top of its own load, may be overloaded and die, and its keys move on to the next node, which dies in turn. One failure cascades through the cluster. Meta's Gutter pool avoids this.",
+    "deeper": "The root cause is that rehashing assumes keys are interchangeable units of load, and they are not. Meta observed that a single key can account for 20 percent of a server's requests. Moving that key to a neighbor that was already running near normal capacity can push it over.\n\nMeta's Gutter pool breaks the chain: about 1 percent of servers kept idle absorb a failed server's traffic, so no healthy server's load changes. Gutter entries expire quickly to limit staleness. It cut client-visible failures by 99 percent.\n\nThe chapter's quiz answer summarizes: load per key is uneven, a hot key moved to a healthy node can overload it and cause cascading failures, and Meta sends failed nodes' traffic to a small, idle Gutter pool with short TTLs. Replicating hot keys, via replicated pools or per-zone copies as in EVCache, also reduces the risk, since losing one copy leaves others serving the key.",
+    "quiz": {
+      "q": "Why is rehashing a failed cache node's keys onto surviving nodes risky?",
+      "a": "Load per key is uneven; a hot key moved onto a healthy node can overload it, which fails and pushes load onward, cascading through the cluster."
+    }
+  },
+  {
+    "id": "ch06-073",
+    "chapter": 6,
+    "section": "6.14 Failure modes",
+    "title": "Retry storms: when timeouts multiply the load",
+    "body": "Retry storms happen when clients retry cache timeouts by going to the database, or retry database timeouts repeatedly. Each retry adds load exactly when the system is already struggling, so the load grows as things get worse. The chapter's guidance: cap retries, use backoff, and treat cache errors as misses only when the database can take the extra load. Meta's clients, for example, skip the cache fill after a UDP get error, to avoid adding load.",
+    "deeper": "Retries are the last link in the chapter's failure cascade: cache nodes restart or fail, the hit ratio drops, database load rises, database latency and timeouts rise, and clients retry, which pushes database load higher still. Without limits, this loop can keep a database overloaded even after the original trigger is gone.\n\nCapping retries bounds how much any one request can amplify load. Backoff spreads retries out in time so they do not arrive as a synchronized wave. Treating cache errors as misses is the default look-aside behavior, but it quietly converts every cache problem into database load, so it is only safe when the database has headroom.\n\nMeta's choice to skip the fill after a UDP get error is a small example of load-aware design: the client still fetches the value, but does not add a set to a cache that might be congested. The diagram's other mitigations for the database stage, leases, request coalescing and load shedding, also help by reducing duplicate queries and refusing excess work gracefully.",
+    "quiz": {
+      "q": "Why should clients cap retries and use backoff when cache or database requests time out?",
+      "a": "Retries add load precisely when the system is overloaded, amplifying the problem; caps limit amplification and backoff spreads retries out."
+    }
+  },
+  {
+    "id": "ch06-074",
+    "chapter": 6,
+    "section": "6.14 Failure modes",
+    "title": "Stale data that never expires",
+    "body": "One failure mode is almost embarrassingly simple: a missed invalidation with no TTL lives forever. Whether the delete was lost to an app crash, dropped by the network, or undone by a stale set, the wrong value stays in the cache indefinitely if nothing forces it out. Users see old data with no end in sight, and the bug can be very hard to trace. The rule the chapter repeats is always set a TTL.",
+    "deeper": "Why does this happen in practice? Teams often skip TTLs because they already invalidate on write and a TTL seems redundant, or because they want the highest possible hit ratio. But the invalidation section showed at least three ways invalidation can fail: stale sets, replication-lag refills and lost invalidations. Even commit-log invalidators like McSqueal and Flux can miss a key through a bug in key extraction or a write path that bypasses them.\n\nA TTL does not prevent any of these, but it caps the damage. A stale entry becomes a stale entry for at most the TTL rather than forever. That turns a potentially permanent data bug into a transient one.\n\nThe cost of adding a TTL is some extra misses as entries expire, which should be spread with jitter so many keys do not expire together, and handled with leases, coalescing or early refresh for hot keys. That is a small price compared with data that never corrects itself.",
+    "quiz": {
+      "q": "Why is a missing TTL dangerous even when you invalidate caches on every write?",
+      "a": "Invalidations can fail through lost deletes, stale sets or replica refills; without a TTL, any such stale entry stays wrong forever."
+    }
+  },
+  {
+    "id": "ch06-075",
+    "chapter": 6,
+    "section": "6.14 Failure modes",
+    "title": "Fan-out: a 500-key page waits for its slowest key",
+    "body": "Large values and high fan-out are another failure mode. A page that fetches 500 keys from the cache must wait for the slowest of those 500 responses before it can render. The more keys a request touches, the more likely it is to hit at least one slow server, so page latency is governed by the tail, not the average. Many large responses arriving at once also cause incast congestion. The fix: batch requests, cap fan-out, and watch incast.",
+    "deeper": "Fan-out turns rare slowness into common slowness. If each cache read has only a small chance of being slow, a request reading hundreds of keys is still quite likely to include at least one slow one. Meta's memcache design grapples with this directly: a page load can fetch hundreds of keys, so latency depends on fan-out.\n\nLarge values add to the problem. Each large response takes longer to transfer and fills network buffers faster, so many arriving together at one web server can overflow switch buffers, the incast congestion Meta handles with a sliding window of outstanding requests.\n\nThe mitigations are structural. Batch many keys per request to the same server to reduce round trips. Cap fan-out by designing pages and data models that need fewer keys, or by grouping related data so it can be fetched together, for example with Redis hash tags that place related keys in one slot. And monitor for incast, since it shows up as packet loss and latency spikes rather than obvious errors.",
+    "quiz": {
+      "q": "Why does fetching 500 cache keys for one page hurt latency more than the average per-key latency suggests?",
+      "a": "The page waits for the slowest of 500 responses, so tail latency dominates; many simultaneous responses can also cause incast congestion."
+    }
+  },
+  {
+    "id": "ch06-076",
+    "chapter": 6,
+    "section": "6.14 Failure modes",
+    "title": "Eviction surprises: a new feature evicts your valuable keys",
+    "body": "Eviction surprises happen when a new feature starts writing many low-value keys into a shared cache. The cache fills, its eviction policy pushes out older entries, and some of those were valuable, frequently read keys serving another workload. That workload's hit ratio falls and its database load rises, even though nobody changed its code. The fix is isolation: use separate pools, as Meta does, or separate clusters per workload, so one workload's churn cannot destroy another's cache.",
+    "deeper": "The danger is that the damage shows up far from the cause. The team shipping the new feature sees nothing wrong; the team whose database suddenly runs hot sees no change in their own code. Because a small hit-ratio drop multiplies database load, a feature that evicts even a few percent of another workload's hot set can cause real trouble. In the chapter's example, dropping from 99 to 95 percent is five times the database load.\n\nMeta's pools give each workload its own servers and memory, and mcrouter routes keys to the right pool by key prefix, so a low-value, high-churn key set cannot evict valuable keys elsewhere. Separate clusters per workload achieve the same isolation at a coarser level.\n\nIsolation also helps with sizing: each pool can be sized by its own memory and throughput needs. Twitter's slab calcification problem is a related memory-allocation surprise inside a single cache, solved by Twemcache's slab-level eviction.",
+    "quiz": {
+      "q": "How can launching a new feature raise database load for an unrelated service, and what prevents it?",
+      "a": "Its low-value keys fill a shared cache and evict the other service's valuable keys, lowering its hit ratio. Separate pools or clusters per workload prevent this."
+    }
+  },
+  {
+    "id": "ch06-077",
+    "chapter": 6,
+    "section": "6.14 Failure modes",
+    "title": "The failure cascade: from a few restarts to a DB meltdown",
+    "body": "Cache failures cascade in a predictable chain. Cache nodes restart or fail. The hit ratio drops, for example from 99 to 90 percent. Database load rises tenfold. Database latency and timeouts rise. Clients retry, adding still more load. Each link can be broken. The Gutter pool, warm restarts and cold cluster warmup keep the hit ratio from dropping. Leases, request coalescing and load shedding protect the database once load rises, while capped retries with backoff stop the retry loop.",
+    "deeper": "Seen as a whole, almost every technique in the chapter maps to a stage of this cascade.\n\nStage one, cache capacity lost: Meta's Gutter pool absorbs failed servers' traffic, CacheLib warm restarts keep deployed nodes full, Cold Cluster Warmup fills new clusters from warm peers, slow rolling restarts limit how much is cold at once, and cross-region replication (EVCache, CacheFront) keeps failover regions warm.\n\nStage two, database load surges: leases limit refills to one client per key, cutting Meta's herd-prone peak from 17,000 to 1,300 queries per second; request coalescing merges duplicate misses; load shedding and admission control refuse excess work gracefully; serving stale on error avoids hitting the database at all.\n\nStage three, retries: cap them, add backoff, and treat cache errors as misses only when the database can take it.\n\nThe design-time version is the opening senior lens: could the database survive if this cache were empty? DynamoDB's constant-work refresh to MemDS is the extreme answer: make the backend's load independent of hit ratio.",
+    "quiz": {
+      "q": "In the cache failure cascade, which mitigations act before database load rises and which act after?",
+      "a": "Before: Gutter pool, warm restarts, cold cluster warmup keep hit ratio up. After: leases, request coalescing and load shedding protect the database, plus capped retries with backoff."
+    }
+  }
+]

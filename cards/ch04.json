@@ -1,0 +1,842 @@
+[
+  {
+    "id": "ch04-001",
+    "chapter": 4,
+    "section": "Chapter introduction",
+    "title": "Databases don't want objects. They want a disk.",
+    "body": "Object storage hands you whole immutable objects by key, which is perfect for photos. A database is different. The profile store, the message store and the search index want a disk: a long array of fixed-size blocks they can read and overwrite at any offset, thousands of times per second, with sub-millisecond latency. Above all, they need a promise that a write is safe once fsync returns. That need for random overwrites plus a durability guarantee is why block storage exists as its own world alongside object storage.",
+    "deeper": "The chapter walks this world in a deliberate order. First the concepts: what block storage is and how clouds sell it. Then AWS EBS in depth, since it is the best documented example, followed by how Google and Azure build the same product. Then the big choice every senior engineer eventually faces: network-attached disks or local NVMe flash inside the host. After that it drops down to the filesystem on the node, because the way ext4, XFS, the page cache and fsync behave directly decides whether a database commit is really safe and how fast commits can go. Finally it covers Kubernetes storage: how stateful workloads get disks inside a system originally built for stateless ones, and how companies actually run databases on it without losing data. Keep the 1-billion-user app in mind throughout: photos went to objects in the previous chapter, but every database behind that app lives on the block storage described here.",
+    "quiz": {
+      "q": "Why can't a database simply store its data as whole objects in an object store?",
+      "a": "It needs to overwrite small blocks at arbitrary offsets thousands of times per second at sub-millisecond latency, with a durability guarantee when fsync returns. Objects are whole and immutable."
+    }
+  },
+  {
+    "id": "ch04-002",
+    "chapter": 4,
+    "section": "4.1 Block storage concepts",
+    "title": "A block device: just numbered blocks, no names, no files",
+    "body": "A block device exposes a flat array of fixed-size blocks, usually 512 bytes or 4 KiB each. It supports only three operations: read N blocks at offset X, write N blocks at offset X, and flush. There are no filenames, no directories and no metadata at all. Everything humans think of as structure, such as files, folders and permissions, is built on top by a filesystem like ext4 or XFS, or directly by a database engine that manages the raw blocks itself.",
+    "deeper": "This minimalism is the whole point. Because the device promises nothing beyond reading and writing numbered blocks, any higher layer can impose its own layout and rules. A filesystem turns the array into files and directories with a journal to protect its metadata. A database engine might keep its own page format, buffer pool and write-ahead log, and care only that when it writes block 81,920 and flushes, that block is durable. The flush operation is the critical third verb: reads and writes may be buffered along the way, and flush is how a caller demands that previous writes reach stable storage. Block size matters too. A 4 KiB block means even a 1-byte change rewrites at least 4 KiB, and databases typically read in 8-16 KiB pages, which is why the chapter later describes their random-read workloads in those sizes. Understanding that a block device has no notion of files helps explain later topics, such as why a snapshot of blocks is only crash-consistent: the device cannot know which blocks form a complete, consistent file.",
+    "quiz": {
+      "q": "Where do files and directories come from if a block device only knows numbered blocks?",
+      "a": "A higher layer builds them. A filesystem such as ext4 or XFS, or a database engine, imposes structure and metadata on top of the raw block array."
+    }
+  },
+  {
+    "id": "ch04-003",
+    "chapter": 4,
+    "section": "4.1 Block storage concepts",
+    "title": "A cloud volume looks like a local disk but lives across the network",
+    "body": "In the cloud, a volume is a virtual block device. The virtual machine sees something that looks exactly like a local disk, for example /dev/nvme1n1, but the blocks actually live on storage servers elsewhere in the network. Crucially, the volume's life is separate from the VM's life. You can detach a volume, attach it to a different VM, take a snapshot of it and resize it, all without the data being tied to one particular machine.",
+    "deeper": "Separating the volume's lifecycle from the VM is what makes network block storage operationally attractive. If a VM dies, its volume is still intact on the storage servers and can be attached to a replacement VM, often within minutes. You can grow capacity without changing instance type. You can snapshot for backups. The price is that every I/O crosses the network, which adds latency compared with flash physically inside the host, and that the volume depends on a whole distributed storage system with its own failure modes. Later sections show both sides: AWS EBS, where the network hop and noisy neighbors were the hard engineering problems for years, and local NVMe instance storage, which avoids the hop but loses the data when the instance stops. On modern AWS Nitro instances the illusion goes further: a remote EBS volume is presented to the guest as an NVMe device, and a dedicated card handles the network protocol, encryption and I/O processing, so the operating system genuinely cannot tell the disk is remote.",
+    "quiz": {
+      "q": "What can you do with a cloud volume that you cannot do with a disk tied to one machine's lifecycle?",
+      "a": "Detach it, attach it to another VM, snapshot it and resize it, because its lifecycle is independent of any single VM."
+    }
+  },
+  {
+    "id": "ch04-004",
+    "chapter": 4,
+    "section": "4.1 Block storage concepts",
+    "title": "IOPS, throughput, latency: the three numbers of every volume",
+    "body": "Three numbers describe a volume's performance. IOPS, input/output operations per second, counts how many separate reads and writes it can do; databases doing random 8-16 KiB reads care most about this. Throughput, measured in MiB/s, counts how many bytes per second move; log scans and backups care about this. Latency is how long a single I/O takes; transaction commit time depends directly on it. Knowing which of the three your workload is bound by tells you what to buy and what to tune.",
+    "deeper": "The three are not independent, and much confusion in capacity planning comes from treating them as if they were. Two relationships tie them together. First, throughput equals IOPS multiplied by I/O size, so the same volume can look IOPS-limited for one workload and throughput-limited for another. Second, Little's Law ties latency to IOPS through queue depth: achievable IOPS equals the number of I/Os in flight divided by latency. That means latency quietly caps IOPS for any application that does not issue many I/Os in parallel. Matching workloads to metrics: an OLTP database serving random point lookups is IOPS and latency sensitive; a backup job or a sequential log scan wants throughput and hardly cares about per-I/O latency; a transaction commit path waits on at least one storage round trip, so its speed is latency bound. When a team says 'the disk is slow', the first useful question is which of these three numbers is actually hitting its limit.",
+    "quiz": {
+      "q": "Which of the three volume metrics most directly determines transaction commit time, and why?",
+      "a": "Latency, because each commit must wait for at least one storage round trip (the WAL write and fsync) to complete before it is acknowledged."
+    }
+  },
+  {
+    "id": "ch04-005",
+    "chapter": 4,
+    "section": "4.1 Block storage concepts",
+    "title": "Throughput = IOPS x I/O size, so which cap you hit depends on size",
+    "body": "Throughput and IOPS are linked by a simple formula: throughput equals IOPS multiplied by the size of each I/O. Consider a volume capped at 16,000 IOPS and 1,000 MiB/s. With large I/Os, you reach the 1,000 MiB/s throughput cap long before you issue 16,000 operations. With small I/Os, you hit the 16,000 IOPS cap while moving far fewer bytes than the throughput limit. So the same volume behaves differently depending on I/O size.",
+    "deeper": "Work the numbers to see where the crossover lies. 1,000 MiB/s divided by 16,000 IOPS is about 64 KiB. Any I/O larger than roughly 64 KiB will exhaust the throughput cap first; any smaller I/O will exhaust the IOPS cap first. A database doing random 8 KiB page reads at the full 16,000 IOPS moves only about 125 MiB/s, one eighth of the throughput it paid for. A backup streaming 1 MiB chunks hits 1,000 MiB/s at only about 1,000 IOPS, one sixteenth of the IOPS budget. This is why cloud providers moved toward provisioning IOPS and throughput separately: different workloads saturate different dimensions, and forcing them to buy both together wastes money. It also explains why HDD volume types in AWS quote their IOPS at a 1 MiB I/O size: spinning disks are built for big sequential transfers, and quoting at small sizes would look terrible. When sizing a volume, start from the workload's typical I/O size, then check both caps.",
+    "quiz": {
+      "q": "A volume is capped at 16,000 IOPS and 1,000 MiB/s. Which cap does a workload of 1 MiB I/Os hit first, and why?",
+      "a": "Throughput. At 1 MiB per I/O, 1,000 MiB/s is reached at only about 1,000 IOPS, far below the 16,000 IOPS cap."
+    }
+  },
+  {
+    "id": "ch04-006",
+    "chapter": 4,
+    "section": "4.1 Block storage concepts",
+    "title": "Little's Law: why one thread can't use the IOPS you paid for",
+    "body": "Little's Law links latency and IOPS: IOPS equals queue depth divided by latency, where queue depth is the number of I/Os in flight at once. With 0.5 ms latency and only one outstanding I/O at a time, you can do at most 2,000 IOPS, no matter what you provisioned. To reach 64,000 IOPS at 0.5 ms, you need about 32 I/Os in flight simultaneously. This is why a single-threaded application often cannot use the IOPS it paid for.",
+    "deeper": "The arithmetic is worth internalizing. One I/O taking 0.5 ms means 1 / 0.0005 = 2,000 per second if you wait for each to finish before starting the next. Latency is a property of the storage path, including the network hop for a cloud volume, and is largely fixed for a given product. The only way to multiply IOPS at fixed latency is concurrency: many threads issuing synchronous I/O, or asynchronous I/O that keeps many requests outstanding. 64,000 x 0.0005 = 32, hence the 32 in flight. The same law shows up again when discussing databases: a single commit stream waiting on one fsync at a time over a 0.5 ms network path cannot exceed about 2,000 commits per second, which is why databases batch commits together. When a benchmark shows a volume delivering a small fraction of its rated IOPS, check the queue depth before blaming the storage. The provisioned IOPS figure is a ceiling that only a sufficiently parallel workload can reach.",
+    "quiz": {
+      "q": "A volume offers 64,000 IOPS at 0.5 ms latency, but a single-threaded app gets about 2,000 IOPS. Why?",
+      "a": "Little's Law: with one I/O in flight at 0.5 ms each, the maximum is 1/0.0005 = 2,000 IOPS. Reaching 64,000 needs about 32 I/Os in flight or lower latency."
+    }
+  },
+  {
+    "id": "ch04-007",
+    "chapter": 4,
+    "section": "4.1 Block storage concepts",
+    "title": "Common mistake: buying more IOPS to fix a latency-bound app",
+    "body": "A frequent error is responding to a slow single-threaded workload by provisioning a bigger IOPS number. If the application issues one synchronous I/O at a time, it is limited by latency, not by the IOPS ceiling, so extra provisioned IOPS go completely unused. The real fixes are more parallelism, meaning more I/Os in flight at once, or lower-latency storage such as local NVMe flash. Diagnose which limit you are actually hitting before spending money on the wrong one.",
+    "deeper": "The mistake is attractive because the IOPS number is the most visible knob on a cloud volume and raising it is one API call. But Little's Law makes the outcome predictable. At 0.5 ms network latency, one synchronous I/O at a time caps out near 2,000 IOPS; a volume provisioned for 16,000 or 64,000 IOPS will report the same 2,000 because the application never asks for more. Two fixes actually move the needle. Increasing concurrency, through more worker threads, asynchronous I/O or batching, raises the number of I/Os in flight so the provisioned ceiling becomes reachable. Reducing latency, for example moving to local NVMe where latency is tens of microseconds instead of hundreds, raises the ceiling for the same queue depth. The database world uses both: group commit batches many transactions into one fsync, and some companies move latency-sensitive databases to local disks. A good diagnostic habit is to measure observed latency and queue depth first; if queue depth is near one, the IOPS setting is not your problem.",
+    "quiz": {
+      "q": "An app issues one synchronous I/O at a time and is slow. Why won't tripling provisioned IOPS help?",
+      "a": "It is latency-bound: IOPS = queue depth / latency, and queue depth is one. Only more parallelism or lower-latency storage raises its throughput."
+    }
+  },
+  {
+    "id": "ch04-008",
+    "chapter": 4,
+    "section": "4.1 Block storage concepts",
+    "title": "Three ways clouds sell disk performance",
+    "body": "Clouds sell volume performance in three ways. Older types, such as AWS gp2 and Azure Premium SSD, tie IOPS to capacity, so you buy a big disk just to get IOPS. Newer types, such as AWS gp3 and io2, Azure Premium SSD v2 and Ultra, and Google Hyperdisk, let you provision capacity, IOPS and throughput separately. Finally, small volumes can use burst credits, running above their baseline for a while by spending from a credit bucket.",
+    "deeper": "The shift from size-tied to independently provisioned performance reflects the IOPS-versus-throughput tension. Under the size-tied model, a small but hot database, say 200 GiB needing many IOPS, forces you to buy terabytes of capacity you do not use. Provisioned models decouple the dimensions, so you pay for what the workload actually consumes. Azure's lineup shows the contrast clearly: Premium SSD has performance tied to size tier, while Premium SSD v2 includes a free baseline of 3,000 IOPS and 125 MB/s and lets you raise each dimension separately, and Ultra Disk lets you change performance at runtime. Burst credits suit spiky, mostly idle workloads, but they create a trap: a volume that benchmarks well during a burst can drop to its much lower baseline once the credit bucket drains, often in the middle of a sustained load. When evaluating a volume type, identify which model it uses, what the sustained baseline is, and whether your capacity purchase is being driven by space or by performance needs.",
+    "quiz": {
+      "q": "Why might a team using a size-tied volume type end up paying for storage it never fills?",
+      "a": "Because IOPS scale with capacity, a small but I/O-hungry database must buy a much larger disk just to obtain enough IOPS."
+    }
+  },
+  {
+    "id": "ch04-009",
+    "chapter": 4,
+    "section": "4.1 Block storage concepts",
+    "title": "Cloud snapshots are incremental copies of changed blocks",
+    "body": "A snapshot is a point-in-time copy of a volume. Cloud snapshots are incremental: the first snapshot stores all the blocks that have been written, and each later snapshot stores only the blocks that changed since the previous one. AWS stores EBS snapshots in S3-backed storage. This makes frequent snapshots affordable, since a mostly static volume adds little new data per snapshot, and it moves the backup copy into far more durable storage than the volume itself.",
+    "deeper": "Incrementality is what makes snapshots practical at scale. A 1 TiB volume where only a few GiB change per day costs only those few GiB per daily snapshot after the first full copy. Storing snapshots in S3-backed storage matters for durability: an EBS volume is replicated only inside one Availability Zone and is rated around 99.8-99.9% annual durability, while the snapshot lives in object storage designed for far higher durability. That is why the chapter repeatedly says EBS must never be a database's only copy: snapshots and replicas are the backstop. Snapshots also power workflows beyond backup. In Kubernetes, a new PersistentVolumeClaim can be created from a snapshot, or cloned from another claim, to spin up test copies or restore after mistakes. The key limitation, covered separately, is consistency: a snapshot captures blocks, not application state, so by default it resembles a disk after a sudden power cut rather than a cleanly shut down database.",
+    "quiz": {
+      "q": "Why do incremental snapshots make frequent backups of a large, mostly static volume cheap?",
+      "a": "After the first full copy, each snapshot stores only blocks changed since the last one, so a volume with few changes adds little data per snapshot."
+    }
+  },
+  {
+    "id": "ch04-010",
+    "chapter": 4,
+    "section": "4.1 Block storage concepts",
+    "title": "Crash-consistent snapshots: like pulling the power cord",
+    "body": "A cloud snapshot is crash-consistent: it looks exactly like the disk would after a power cut. Blocks already on the volume are captured, but writes still sitting in the operating system's page cache, never flushed, are missing. A database restored from such a snapshot recovers the same way it does after a crash, by replaying its write-ahead log. For application-consistent snapshots, you must freeze the filesystem or tell the database to checkpoint before taking the snapshot.",
+    "deeper": "The reason is that the storage system sees only blocks. It has no idea which blocks form a complete transaction or which pending writes are still in memory on the VM. Taking a snapshot at an arbitrary moment therefore freezes the volume in whatever half-finished state it happens to be in, just as a sudden power loss would. Well-built databases are designed to survive exactly that: on startup they read their write-ahead log (WAL) and replay or roll back work so the data files reach a consistent state. Anything the application wrote with plain write() but never fsync'd, though, never reached the volume and is simply gone. When crash consistency is not good enough, for example for software that does not recover cleanly or when you want a restore to need no recovery step, you coordinate: freeze the filesystem so no writes are in progress, or ask the database to checkpoint, then snapshot, then resume. Kubernetes VolumeSnapshots follow the same rule and are crash-consistent by default.",
+    "quiz": {
+      "q": "Why is a cloud snapshot 'crash-consistent', and what does a database do when restored from one?",
+      "a": "It captures volume blocks at one instant, like a power cut, missing unflushed page-cache data. The database replays its write-ahead log on startup to become consistent."
+    }
+  },
+  {
+    "id": "ch04-011",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "EBS: from 120-IOPS hard drives in 2008 to 140 trillion ops a day",
+    "body": "AWS Elastic Block Store launched on August 20, 2008, as network-attached block storage for EC2 virtual machines. The first version ran on hard drives that delivered about 120-150 IOPS per drive with 6-8 ms average latency. The first SSD-backed volume type arrived in August 2012, offering a maximum of 1,000 IOPS. By 2024, AWS engineer Marc Olson wrote that EBS delivers over 140 trillion operations daily across a distributed SSD fleet.",
+    "deeper": "The trajectory shows how much the product changed underneath a stable interface. Customers always saw a block device attached to their instance, but the media moved from spinning disks to SSD, the storage client moved off the host CPU onto dedicated Nitro cards starting in 2013-2014, and AWS built its own network transport, SRD, whose foundation was laid in 2014. Olson also noted that EBS can now give a single instance more IOPS than an entire Availability Zone could get in the early years, a striking measure of progress. Comparing the endpoints helps calibrate intuition: 6-8 ms average latency on the original hard-drive design versus io2 Block Express, which is designed for average latency under 500 microseconds for 16 KiB I/O. That is more than an order of magnitude improvement in latency, which by Little's Law translates directly into more IOPS per unit of concurrency and higher commit rates for databases. The history also explains why so much later EBS engineering focused on isolation and control planes rather than raw media speed.",
+    "quiz": {
+      "q": "What does 'a single instance can get more IOPS than an entire AZ could in the early years' say about EBS's evolution?",
+      "a": "Moving from HDDs to SSDs, offloading to Nitro and building SRD raised per-instance performance by orders of magnitude while keeping the same block-device interface."
+    }
+  },
+  {
+    "id": "ch04-012",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "Noisy neighbors: EBS's first hard problem",
+    "body": "In early EBS, many customer volumes shared the same physical disks and the same network. That meant one busy customer could slow down everyone else on the same hardware, a problem known as noisy neighbors. For block storage, which databases depend on for predictable latency, this unpredictability was a serious flaw. AWS attacked it over many years with three kinds of changes: better queueing and isolation, the move from hard drives to SSD, and moving the storage client off the host CPU.",
+    "deeper": "Noisy neighbors are the fundamental cost of sharing. Pooling many customers onto shared disks and network links is what makes cloud storage economical, but without isolation one tenant's heavy scan can inflate everyone else's latency. Hard drives made this worse: at roughly 120-150 IOPS per drive, a single aggressive workload could saturate a spindle. SSDs provide vastly more IOPS per device, so the same contention causes far less damage. Improved queueing and isolation allocate capacity fairly among tenants. Moving the storage client from the hypervisor on the host CPU onto dedicated Nitro cards removed another source of jitter, since storage processing no longer competed with customer workloads for CPU cycles. The problem has not vanished entirely at the Kubernetes layer: the chapter warns that pods on the same node share network bandwidth to EBS and the instance's EBS limits, so a heavy database pod can hurt others on its node. The standard mitigation there is to put heavy databases on dedicated node pools.",
+    "quiz": {
+      "q": "Why did the move from HDDs to SSDs help EBS with noisy neighbors, not just raw speed?",
+      "a": "Each SSD offers far more IOPS than a 120-150 IOPS hard drive, so one tenant's heavy load consumes a much smaller share and hurts neighbors less."
+    }
+  },
+  {
+    "id": "ch04-013",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "EBS chain replication and why it needs a configuration master",
+    "body": "An EBS volume is replicated inside one Availability Zone. In the simplified model from AWS's Physalia paper, EBS uses chain replication: writes flow from the client, the EC2 host, to a primary storage server, then on to a replica, before being acknowledged. Normal operation needs no coordination. But when a server fails, the chain must change: a new replica is chosen, data is re-mirrored, and everyone must agree which copy is primary. That agreement requires a strongly consistent configuration master.",
+    "deeper": "Chain replication is elegant because the happy path is a simple pipeline: host to primary to replica, then acknowledge. No voting happens on each write, which keeps latency low. The complexity is concentrated in reconfiguration. If the primary or replica fails, the system must pick a replacement, copy the data to it (re-mirroring), and ensure there is exactly one agreed primary. If two servers each believed they were primary, clients could write divergent data, which is catastrophic for a block device. So the configuration, meaning who is in the chain and who leads, must live in a strongly consistent store that every party trusts. This configuration master is small in data but critical in availability: if it cannot answer, volumes that need to reconfigure are stuck. The 2011 EBS outage showed what happens when that configuration store is shared and overloaded, and Physalia, published at NSDI 2020, is AWS's redesign of it. Note also the zonal scope: replication inside one AZ means an EBS volume does not survive the loss of its AZ.",
+    "quiz": {
+      "q": "In EBS chain replication, why does normal writing need no coordination but failure handling does?",
+      "a": "Writes just flow host to primary to replica. After a failure, a new replica must be chosen and everyone must agree who is primary, which needs a strongly consistent configuration master."
+    }
+  },
+  {
+    "id": "ch04-014",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "April 21, 2011: the EBS re-mirroring storm",
+    "body": "On April 21, 2011, an incorrect network change isolated many EBS nodes in one Availability Zone at the same time. When connectivity returned, the nodes all tried to re-mirror their data at once, a re-mirroring storm, and ran out of free capacity. About 13% of volumes in the AZ became stuck. Worse, the replication configuration lived in the EBS control plane, in a database shared with API traffic, so the failure spread beyond one zone.",
+    "deeper": "The cascade is a textbook example of correlated failure. Each node's reaction, re-mirror when you lose your partner, was correct in isolation. But when thousands did it simultaneously, they exhausted the spare capacity needed to create new replicas, so volumes could not complete re-mirroring and stayed stuck. Every one of those re-mirroring attempts also required negotiating configuration changes. Because that configuration was stored in a database shared with the regional EBS API, the storm of negotiations overloaded it. Its thread pools filled up, and as a result API calls for other Availability Zones in the same region also degraded, even though those zones had no network problem. In other words, a fault in one AZ's network became a regional control-plane problem because of a shared dependency. AWS's lesson from this incident centered on the idea of blast radius, and it directly motivated the design of Physalia, which splits configuration into millions of independent cells so that no single overloaded store can hurt everyone.",
+    "quiz": {
+      "q": "Why did a network fault in one AZ in 2011 degrade EBS API calls in other AZs of the region?",
+      "a": "Replication configuration lived in a control-plane database shared with API traffic. The re-mirroring storm overloaded it, filling thread pools and slowing APIs region-wide."
+    }
+  },
+  {
+    "id": "ch04-015",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "Blast radius: how many customers break when one thing does",
+    "body": "Blast radius is the set of customers hurt by a single failure. The 2011 EBS outage made the lesson concrete: because one shared configuration database served the whole region, a problem in one place hurt everyone who depended on it. Designing for small blast radius means splitting shared dependencies so any single failure touches only a small slice of customers. It is a property you can reason about for any system, not just storage.",
+    "deeper": "Blast radius turns vague reliability goals into a concrete design question: if this component fails or gets overloaded, who notices? A single global database, a single configuration service or a single shared queue has a blast radius equal to everyone using it, no matter how reliable it is on paper, because rare failures do eventually happen and overload can come from unexpected places such as a recovery storm. Shrinking blast radius usually means partitioning: many independent copies of a service, each serving a subset of customers and not coordinating with the others, so failure in one cannot cascade. The cost is more units to deploy, monitor and manage. In 2011 the EBS configuration lived in one control-plane database shared with regional API traffic; the redesign, Physalia, pushed partitioning to the extreme, with each cell handling roughly one volume. The chapter's senior staff advice generalizes this: in design reviews, ask for the blast radius of every shared dependency, and pay special attention to configuration stores, which are small, easy to overlook and critical to everything.",
+    "quiz": {
+      "q": "Why can a highly reliable single shared database still be a poor design from a blast-radius perspective?",
+      "a": "When it does fail or overload, every customer depending on it breaks at once. Its blast radius is everyone, regardless of how rarely that happens."
+    }
+  },
+  {
+    "id": "ch04-016",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "Physalia: millions of tiny Paxos databases, one per volume",
+    "body": "Physalia, described at NSDI 2020, is AWS's transactional key-value store built to be the configuration master for EBS. Instead of one big database, it runs a colony of many small cells. Each cell stores the configuration for a single partition key, roughly one volume, runs Paxos consensus among a small set of nodes, seven in the paper's description, and does not coordinate with any other cell. A single physical node can host many cells.",
+    "deeper": "The cell design attacks the 2011 failure head on. In 2011 one shared configuration database was overwhelmed by a re-mirroring storm. With Physalia, the configuration for each volume lives in its own small consensus group, so a problem affects only the volumes in the affected cells. Paxos inside each cell provides the strong consistency chain replication needs, meaning a single agreed answer to which server is primary, while the absence of cross-cell coordination means cells cannot drag each other down. Seven nodes per cell tolerate several simultaneous node failures while still reaching a majority. Packing many cells onto each node keeps the hardware footprint reasonable despite there being millions of cells. This is the chapter's key example of cell-based architecture for a control plane, where the unit of isolation shrinks down to roughly one customer resource, making the blast radius of any single failure tiny.",
+    "quiz": {
+      "q": "What problem from the 2011 EBS outage does Physalia's cell design fix?",
+      "a": "One shared control-plane database let a storm in one AZ hurt the region. Physalia splits configuration into millions of independent cells, so failures affect only volumes in the affected cells."
+    }
+  },
+  {
+    "id": "ch04-017",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "Physalia skips global availability and aims where it matters",
+    "body": "The CAP theorem says a system cannot be both available and consistent everywhere during a network partition. Physalia does not try to beat CAP. Instead it aims to be extremely available for the specific keys each client needs, for the specific clients that need them. A volume's configuration only has to be reachable by the parties that actually use that volume, so availability for anyone else is irrelevant. This reframing makes strong consistency and practical high availability compatible.",
+    "deeper": "Most systems frame availability globally: can any client reach any data? Under partition, CAP forces a choice between answering possibly inconsistent data and refusing to answer. Physalia sidesteps the dilemma by narrowing the question. For EBS configuration, the only parties that care about a given volume's configuration are the EC2 instance using the volume and the storage servers holding it. If some unrelated client on the far side of the network cannot reach that cell, nothing is lost. So Physalia keeps Paxos-based strong consistency and concentrates on making each cell reachable from its own clients. This insight connects directly to its placement strategy, which puts each cell's nodes near its clients so that partitions separating the cell from its clients are rare and, when they happen, would also separate the instance from its data anyway. The broader design lesson for any control plane: define availability per key and per client, and you may find that strong consistency costs far less than a global analysis suggests.",
+    "quiz": {
+      "q": "How does Physalia coexist with the CAP theorem rather than trying to defeat it?",
+      "a": "It gives up global availability and targets extreme availability only for the keys each client needs, for the clients that need them, keeping strong consistency."
+    }
+  },
+  {
+    "id": "ch04-018",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "Physalia puts each cell next to the volume it configures",
+    "body": "Physalia places each cell's nodes close, in network topology, to the only parties that care about that volume's configuration: the EC2 instance using it and the storage servers holding it. Because they are near each other, a network partition that separates the cell from its volume is almost certainly a partition that also separates the instance from its data. In that case the volume is unusable anyway, so the cell being unreachable adds little extra unavailability. Cells also move as clients move.",
+    "deeper": "This placement rule is what makes the per-client availability goal achievable in practice. Imagine the opposite: configuration stored in a distant central region. A partition between the instance's rack and that region would block reconfiguration even though the instance and its storage servers can still talk perfectly well, creating unavailability purely from the control plane. By co-locating the cell with the data path, Physalia makes the control plane's failure domain overlap the data plane's failure domain. The two tend to fail together, so the control plane rarely causes an outage on its own. Because instances move and volumes are re-mirrored to new servers, the cells must migrate too, keeping close to wherever their clients currently are. Placement is balanced with diversity inside the cell: its seven nodes are spread over enough racks and power domains that small failures do not stop it. Close enough to share fate with the clients, spread enough that a single rack or power fault does not take out a majority.",
+    "quiz": {
+      "q": "Why does Physalia place a cell's nodes near the EC2 instance and storage servers of its volume?",
+      "a": "Only they need the configuration. A partition cutting the cell off from them likely also cuts the instance from its data, so nearby placement adds little extra unavailability."
+    }
+  },
+  {
+    "id": "ch04-019",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "Physalia's cells survive rack failures and were proven with TLA+",
+    "body": "Two further ideas complete Physalia. First, diversity inside a cell: the nodes of one cell are spread over enough racks and power domains that small failures, such as one rack losing power, do not stop the cell from reaching consensus. Second, formal methods: the team specified the protocol in TLA+, checked it with a model checker, and tested the implementation with Jepsen. Together these make each tiny database both resilient to local faults and trustworthy in its correctness.",
+    "deeper": "Diversity balances placement. Putting a cell near its clients risks concentrating all seven nodes in one failure domain, where a single rack or power event could remove a majority and halt Paxos. Spreading nodes across racks and power domains within the neighborhood keeps the cell alive through the kinds of small failures that happen constantly in a large fleet. Formal methods address a different risk. A consensus protocol running across millions of cells will encounter every rare interleaving of messages, crashes and restarts sooner or later, so subtle bugs that tests miss would surface in production. TLA+ lets engineers write a precise specification of the protocol, and a model checker exhaustively explores states of that specification to find violations such as two primaries. Jepsen complements this by testing the real implementation under injected faults like partitions and clock problems. For a component that decides which copy of a customer's disk is authoritative, this level of rigor is justified: a configuration bug could corrupt data at massive scale.",
+    "quiz": {
+      "q": "Why would Physalia's designers use TLA+ model checking rather than rely only on ordinary testing?",
+      "a": "Across millions of cells, rare message and crash interleavings will occur. Model checking exhaustively explores protocol states to find bugs, like two primaries, that tests would miss."
+    }
+  },
+  {
+    "id": "ch04-020",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "Senior staff lens: ask for the blast radius of every dependency",
+    "body": "Physalia is the clearest published example of cell-based architecture for a control plane. The question it teaches is: if this dependency breaks, how many customers break with it? A global database gives a global blast radius. Many small, independent cells, each placed next to its users, give a tiny one. In your own design reviews, ask for the blast radius of every shared dependency, and look especially hard at configuration stores, which everything quietly relies on.",
+    "deeper": "Configuration stores deserve special suspicion because they rarely look risky. They hold little data, see modest traffic in steady state and seem simple, so teams often put them in one shared database. But they are consulted precisely during failures, when systems reconfigure, and that is when load spikes, exactly as in the 2011 EBS re-mirroring storm, where configuration negotiations overwhelmed a control-plane database shared with API traffic. Cell-based architecture answers this by dividing the dependency into many independent units, each serving a small set of customers and not coordinating with others, so an overload or bug in one cell stays in that cell. Physalia pushes the idea to roughly one cell per volume and adds placement next to the clients. You need not copy that extreme granularity, but the review habit transfers: for each shared component, estimate the fraction of customers that fail if it fails, identify what could overload it during recovery, and ask whether it can be split. A system is only as isolated as its most shared dependency.",
+    "quiz": {
+      "q": "In a design review, why should configuration stores get particular blast-radius scrutiny?",
+      "a": "They look small and simple but are hit hardest during failures and reconfiguration. A shared one can turn a local fault into a global outage, as in 2011."
+    }
+  },
+  {
+    "id": "ch04-021",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "Nitro cards: taking storage work off the host CPU",
+    "body": "Early EBS clients ran in the hypervisor on the host's CPU. That added jitter, meaning unpredictable latency, and stole CPU cycles from customer workloads. Starting in 2013-2014, AWS moved storage processing onto dedicated hardware called Nitro cards. On Nitro instances, an EBS volume appears to the guest operating system as an NVMe device, and the Nitro card handles the network protocol, encryption and I/O processing, leaving the host CPU entirely to the customer.",
+    "deeper": "Offloading solves two problems at once. Performance isolation improves because storage processing no longer competes with guest workloads on shared cores; a busy neighbor VM cannot delay your I/O by hogging hypervisor CPU. Latency becomes more consistent because dedicated hardware does the same work in a predictable way, reducing jitter, which matters especially for tail latency in databases. Presenting the remote volume as a standard NVMe device also simplifies the guest: the operating system uses its ordinary NVMe driver and needs no special paravirtual storage stack. This is why the chapter later calls EBS itself disaggregated storage: storage is pooled on remote servers, yet Nitro presents it to the VM as local NVMe. Encryption on the card means data is protected in transit without guest CPU cost. Nitro also became the home of SRD, the custom transport protocol: for io2 Block Express, AWS says the instance talks to storage using SRD implemented on the Nitro card dedicated to EBS. Offloading was a key step in the long fight against noisy neighbors.",
+    "quiz": {
+      "q": "Besides freeing CPU for customers, why did moving the EBS client onto Nitro cards help databases?",
+      "a": "Dedicated hardware removed hypervisor jitter and contention, making I/O latency more consistent, which reduces tail latency that databases are sensitive to."
+    }
+  },
+  {
+    "id": "ch04-022",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "SRD: spraying packets across many paths to cut tail latency",
+    "body": "SRD, Scalable Reliable Datagram, is a transport protocol AWS built, with its foundation laid in 2014. Instead of sending one flow's packets along a single network path, SRD sprays them across many paths, and handles reordering and retransmission in hardware. On a busy datacenter network, this avoids getting stuck behind one congested path and cuts tail latency. For io2 Block Express, AWS says the instance talks to storage using SRD, implemented on the Nitro card dedicated to EBS.",
+    "deeper": "Traditional transports like TCP typically pin a flow to one path so packets arrive in order. On a large datacenter network, any single path may hit congestion or a slow link, and a flow stuck there suffers high latency even though many other paths are idle. That creates the long tail: most I/Os are fast, a few are very slow. For storage, the slow tail is what users feel, because a database transaction or a request that touches many blocks waits for its slowest I/O. SRD spreads a flow's packets over many paths, so congestion on one affects only a fraction of packets, and relies on the hardware to put things back in order and retransmit losses quickly. Doing this in hardware on the Nitro card keeps it fast and off the host CPU. SRD underpins io2 Block Express, which AWS designed for average latency under 500 microseconds for 16 KiB I/O. The key takeaways credit Nitro and SRD together with moving EBS processing off the host and cutting latency.",
+    "quiz": {
+      "q": "Why does spraying a flow's packets across many network paths reduce tail latency rather than just average latency?",
+      "a": "Congestion on any one path then delays only a fraction of packets instead of the whole flow, so the rare very slow I/Os become much rarer."
+    }
+  },
+  {
+    "id": "ch04-023",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "EBS volume types: gp3, io2 Block Express and the HDD tiers",
+    "body": "AWS EBS offers SSD and HDD volume types. As of 2026: gp3 reaches 80,000 IOPS, 2,000 MiB/s and 64 TiB; gp2 reaches 16,000 IOPS, 250 MiB/s and 16 TiB; io2 Block Express reaches 256,000 IOPS, 4,000 MiB/s and 64 TiB; io1 reaches 64,000 IOPS, 1,000 MiB/s and 16 TiB. The HDD types, st1 and sc1, reach 500 and 250 IOPS at 1 MiB I/O size, with 500 and 250 MiB/s. All max out at 16 TiB except gp3 and io2 Block Express.",
+    "deeper": "The table rewards careful reading. gp3 is the general-purpose workhorse and the provisioned successor to gp2: far higher limits, and IOPS and throughput set separately rather than tied to size. io2 Block Express is the high-end tier for demanding databases: 256,000 IOPS, 4,000 MiB/s and designed for average latency under 500 microseconds for 16 KiB I/O. It became generally available in July 2021, and AWS described it as 'the first SAN built for the cloud'. It is also the only type AWS states at 99.999% durability; gp3, gp2, io1, st1 and sc1 are all stated at 99.8-99.9%. The HDD types are throughput-oriented: their IOPS figures are quoted at 1 MiB I/O size because spinning disks only perform well on large sequential transfers, so they suit log scans or cold bulk data, never random database I/O. The practical selection questions are: what I/O size and pattern the workload has, whether sustained IOPS and throughput fit gp3's limits, whether latency and durability justify io2 Block Express, and what snapshot and replica plan covers durability.",
+    "quiz": {
+      "q": "Why are st1 and sc1 IOPS limits quoted at a 1 MiB I/O size?",
+      "a": "They are hard-drive volumes built for large sequential transfers. Quoting at 1 MiB reflects their intended throughput workloads; small random I/O would perform far worse."
+    }
+  },
+  {
+    "id": "ch04-024",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "99.8-99.9% durable: expect to lose EBS volumes every year",
+    "body": "EBS gp3 and most other types are stated at 99.8-99.9% annual durability. That means 1 to 2 volumes in every 1,000 are lost per year, very different from S3's 11 nines. A back-of-envelope estimate: a fleet of 5,000 gp3 volumes should expect roughly 5 to 10 volume losses per year. EBS is durable enough to hold a database, but never durable enough to be its only copy. You need snapshots, replicas, or both.",
+    "deeper": "The durability column is where intuition often fails. Replicated block storage sounds safe, and 99.9% sounds high, but durability percentages must be read as annual failure rates across a fleet. At 99.8-99.9%, the annual loss rate is 0.1-0.2%, so at 1,000 volumes you expect one or two losses per year and at 5,000 volumes five to ten. For a large company, losing volumes is not a hypothetical; it is a routine yearly event that operations must plan for. Compare that with object storage at 11 nines, where individual object loss is vanishingly rare. The one EBS exception is io2 Block Express, stated at 99.999%, which is far better but still well below object storage. Two things protect a database. Snapshots copy the volume into S3-backed storage, which is far more durable than the volume itself. Replicas in other Availability Zones protect against both volume loss and the loss of a whole AZ, which EBS alone does not survive because it replicates only inside one zone.",
+    "quiz": {
+      "q": "A company runs 5,000 gp3 volumes. Why must it plan operationally for volume loss?",
+      "a": "At 99.8-99.9% annual durability, 1-2 per 1,000 volumes are lost yearly, so about 5 to 10 losses per year are expected. Snapshots or replicas are required."
+    }
+  },
+  {
+    "id": "ch04-025",
+    "chapter": 4,
+    "section": "4.2 AWS EBS in depth",
+    "title": "Common mistake: treating EBS as 'durable like S3'",
+    "body": "It is tempting to assume a managed, replicated cloud disk is as safe as object storage. It is not. EBS is replicated only inside one Availability Zone, so it does not survive the loss of that AZ, and its annual failure rate is measured in tenths of a percent rather than S3's 11 nines. The fix is architectural: run database replicas in other Availability Zones, and take regular snapshots, which are stored in far more durable S3-backed storage.",
+    "deeper": "The mistake has two parts, and each needs its own defense. First, scope: EBS replication happens within one AZ, which protects against a single server or disk failing but not against the zone itself failing through power, network or a large-scale event. Only copies outside that zone help, which is why the fix names replicas in other AZs. Second, rate: even without an AZ failure, individual volumes are lost at roughly 0.1-0.2% per year, so a big fleet sees multiple losses annually. Snapshots address that by keeping a recoverable copy in S3-backed storage. The contrast with other clouds is instructive. Azure offers zone-redundant ZRS disks that replicate synchronously across three zones, and Google offers Hyperdisk Balanced High Availability replicated across two zones, while AWS keeps EBS volumes single-AZ and pushes cross-AZ durability to the application or to managed databases. So on AWS in particular, cross-zone durability is your responsibility, not the disk's. Design the database topology assuming any single volume, or any single zone, can disappear.",
+    "quiz": {
+      "q": "EBS replicates every volume. Why do you still need database replicas in other AZs?",
+      "a": "EBS replicates only inside one AZ, so an AZ loss takes all copies. It also loses 0.1-0.2% of volumes yearly. Cross-AZ replicas and snapshots cover both."
+    }
+  },
+  {
+    "id": "ch04-026",
+    "chapter": 4,
+    "section": "4.3 Google Persistent Disk / Hyperdisk and Azure Managed Disks",
+    "title": "Google Persistent Disk runs on Colossus, the same substrate as YouTube",
+    "body": "Google's Persistent Disk is network block storage for Compute Engine virtual machines. Google lists Compute Engine VMs among the clients of Colossus, its cluster filesystem. That means Google's block storage sits on the same shared storage substrate as Cloud Storage and YouTube. This is an architectural difference from AWS, where EBS is a separate, dedicated block storage system rather than a layer on top of a general-purpose shared filesystem.",
+    "deeper": "The two companies took different routes to the same product. AWS built EBS as its own system with its own replication, control plane (Physalia) and transport (SRD). Google instead layered block storage on Colossus, the cluster filesystem that also underpins Cloud Storage and YouTube, so improvements and scale in the shared substrate benefit block volumes too. Either way, the VM sees a network-attached virtual disk whose lifecycle is independent of the machine. The difference matters mostly to the provider's engineering organization rather than to users, but it illustrates a recurring theme: block storage can be a standalone system or a view over a larger disaggregated storage platform. Alibaba's Pangu, covered in the disaggregation section, follows the second pattern too, sitting underneath Alibaba Cloud's Elastic Block Storage, object storage, NAS and PolarDB. For users, the more visible evolution is Google's newer Hyperdisk generation, which, like AWS gp3 and io2 and Azure Premium SSD v2, provisions capacity, IOPS and throughput separately and comes in variants tuned for different jobs.",
+    "quiz": {
+      "q": "How does Google's block storage architecture differ from AWS EBS?",
+      "a": "Google's Persistent Disk sits on Colossus, the shared cluster filesystem that also serves Cloud Storage and YouTube, whereas EBS is a separate dedicated block storage system."
+    }
+  },
+  {
+    "id": "ch04-027",
+    "chapter": 4,
+    "section": "4.3 Google Persistent Disk / Hyperdisk and Azure Managed Disks",
+    "title": "Hyperdisk: separate knobs and a variant for every job",
+    "body": "Hyperdisk is Google's newer block storage generation, with capacity, IOPS and throughput provisioned separately. It comes in variants. Hyperdisk Balanced is general purpose, up to 160,000 IOPS and 2,400 MiB/s, and can be attached read-write to up to 8 instances. Hyperdisk Balanced High Availability is synchronously replicated across two zones in a region. Hyperdisk Extreme reaches up to 350,000 IOPS for large databases. Hyperdisk Throughput targets analytics scans.",
+    "deeper": "Each variant maps to a distinct workload shape. Balanced covers most databases and applications, and its ability to attach read-write to up to 8 instances is unusual for block storage, which is normally attached to one machine at a time; multi-writer use requires software that coordinates access, since a block device itself has no locking. Balanced High Availability addresses the zonal durability gap: synchronous replication across two zones means a single-zone failure does not lose the volume, contrasting with AWS EBS, which stays single-AZ. Extreme targets the largest, most IOPS-hungry databases, with a ceiling above AWS io2 Block Express's 256,000 IOPS. Throughput is tuned for sequential analytics scans, where bytes per second matter more than operations per second. The pattern reflects the IOPS-throughput-latency trade space from the start of the chapter: rather than one disk type trying to be good at everything, providers offer tuned variants and independent knobs so customers buy exactly the dimension their workload saturates.",
+    "quiz": {
+      "q": "What durability problem does Hyperdisk Balanced High Availability solve that a zonal volume cannot?",
+      "a": "It replicates synchronously across two zones in a region, so the volume survives a single-zone failure, unlike a volume replicated only within one zone."
+    }
+  },
+  {
+    "id": "ch04-028",
+    "chapter": 4,
+    "section": "4.3 Google Persistent Disk / Hyperdisk and Azure Managed Disks",
+    "title": "Hyperdisk ML: one volume, 2,500 readers, 1.2 TB/s",
+    "body": "Hyperdisk ML is a Google variant built for machine learning. One volume can be attached read-only to up to 2,500 instances at once, which suits loading model weights and training data onto a large fleet of machines. Google reported 2,500 nodes reading at 1.2 TB/s. Separately, Hyperdisk offers storage pools, which let you buy capacity and performance in bulk and share them across many disks, instead of provisioning every disk individually.",
+    "deeper": "Hyperdisk ML addresses a problem specific to large-scale ML: thousands of accelerator nodes all need the same large files, such as model weights, at startup or during training. Copying the data to each node separately is slow and wasteful. Because the volume is read-only for all attached instances, there is no need to coordinate writers, so it can safely fan out to 2,500 machines, and aggregate read bandwidth becomes enormous; 1.2 TB/s across 2,500 nodes works out to roughly 480 MB/s per node. Storage pools solve an economic problem. When each disk is provisioned separately, every disk must be sized for its own peak, leaving idle capacity and performance scattered across the fleet. Pooling lets many disks draw on a shared bulk purchase, improving utilization, the same motivation behind disaggregated storage in general. Both features show providers moving beyond the classic model of one disk for one VM toward block storage shaped around fleet-level workloads.",
+    "quiz": {
+      "q": "Why can Hyperdisk ML attach one volume to 2,500 instances when ordinary block volumes attach to one?",
+      "a": "It attaches read-only, so no writers need coordinating; a block device has no locking, which is what normally limits multi-attach."
+    }
+  },
+  {
+    "id": "ch04-029",
+    "chapter": 4,
+    "section": "4.3 Google Persistent Disk / Hyperdisk and Azure Managed Disks",
+    "title": "Azure Managed Disks: five tiers from Ultra to Standard HDD",
+    "body": "Azure Managed Disks come in five types. Ultra Disk: up to 400,000 IOPS, 10,000 MB/s and 64 TiB, with performance changeable at runtime. Premium SSD v2: 80,000 IOPS, 2,000 MB/s, 64 TiB, with 3,000 IOPS and 125 MB/s baseline included free. Premium SSD: 20,000 IOPS, 900 MB/s, 32 TiB, performance tied to size tier. Standard SSD: 6,000 IOPS, 750 MB/s, 32 TiB, for web servers and dev. Standard HDD: 2,000-3,000 IOPS, 500 MB/s, 32 TiB, for backup and non-critical data.",
+    "deeper": "The Azure lineup maps neatly onto the three provisioning models. Premium SSD is the older size-tied model: to get more IOPS you move to a bigger size tier, like AWS gp2. Premium SSD v2 is the provisioned model, like AWS gp3, and its free baseline of 3,000 IOPS and 125 MB/s makes small volumes useful without paying for extra performance. Ultra Disk is the top tier, and uniquely lets you change performance at runtime, so a database can be given more IOPS during a heavy batch window and scaled back afterward without migrating data. Standard SSD and Standard HDD are the budget tiers: Standard SSD for web servers and development environments where consistent high performance is unnecessary, and Standard HDD for backups and non-critical workloads. Note that Azure quotes throughput in MB/s while AWS uses MiB/s, so compare carefully. Choosing among them follows the usual logic: identify the dimension the workload saturates, pick the cheapest tier whose limits cover it, and then choose redundancy, LRS or ZRS, separately.",
+    "quiz": {
+      "q": "Which Azure disk type follows the older size-tied performance model, and what is the downside?",
+      "a": "Premium SSD. Performance comes from the size tier, so a small but I/O-hungry workload must buy a bigger disk than it needs just for performance."
+    }
+  },
+  {
+    "id": "ch04-030",
+    "chapter": 4,
+    "section": "4.3 Google Persistent Disk / Hyperdisk and Azure Managed Disks",
+    "title": "Azure LRS vs ZRS: 11 nines in one datacenter, 12 across zones",
+    "body": "Azure is explicit about disk redundancy. LRS, locally redundant storage, writes synchronously to three copies in one datacenter and is stated at 11 nines of durability. ZRS, zone-redundant storage, replicates synchronously across three availability zones and is stated at 12 nines, at the cost of higher write latency. ZRS is supported only on Premium SSD and Standard SSD. A ZRS disk can be force-detached from a VM in a failed zone and attached to a VM in another zone.",
+    "deeper": "The trade-off is classic: synchronous replication across zones protects against zone failure, but every write must reach copies in other zones before it is acknowledged, adding network distance to write latency. For a latency-sensitive database commit path, that matters, because commit rate is bounded by storage round-trip time. LRS avoids the extra latency but, like AWS EBS, keeps all copies in one location, so it does not survive the loss of that datacenter. The operational superpower of ZRS is recovery: if a zone fails, you can force-detach the disk from the dead VM and attach it to a VM in a healthy zone, getting the same data back without restoring from backup or promoting an application replica. Note the restriction: ZRS is available only on Premium SSD and Standard SSD, not on Ultra Disk or Premium SSD v2, so the highest-performance tiers require application-level replication for zone resilience. Compare the stated LRS durability with EBS's 99.8-99.9%; different providers state durability very differently.",
+    "quiz": {
+      "q": "What does Azure ZRS give you that LRS does not, and what does it cost?",
+      "a": "Synchronous replication across three zones, surviving zone loss and allowing reattachment in another zone, at the cost of higher write latency."
+    }
+  },
+  {
+    "id": "ch04-031",
+    "chapter": 4,
+    "section": "4.3 Google Persistent Disk / Hyperdisk and Azure Managed Disks",
+    "title": "In industry: three clouds, one block storage product shape",
+    "body": "AWS, Google and Azure converged on the same basic product: SSD volumes with independently provisioned IOPS and throughput, a high-end tier with latency near or below 0.5 ms, and optional cross-zone replication, such as Google Hyperdisk Balanced High Availability and Azure ZRS. The notable exception is that AWS EBS volumes stay single-AZ. AWS instead pushes cross-AZ durability to the application or to its managed database services.",
+    "deeper": "Convergence suggests the shape reflects real customer needs rather than any one provider's taste. Independent provisioning emerged because workloads saturate different dimensions; a high-end sub-millisecond tier exists because databases' commit rates are bounded by storage latency; cross-zone replication exists because single-zone durability is not enough for data that must survive a zone failure. AWS's choice to keep EBS single-AZ is a deliberate design position. Cross-zone synchronous replication adds write latency on every I/O and consumes network capacity; AWS instead expects the application layer, database replicas in other AZs, or managed databases to provide zone resilience, where the software knows which writes matter. For architects, the practical consequence is portability of assumptions: a design relying on Azure ZRS force-detach for zone recovery will not work the same way on AWS, where you must plan application-level replication across AZs. Whichever cloud you use, decide explicitly which layer provides cross-zone durability, a theme the chapter develops further in the local-versus-network storage discussion.",
+    "quiz": {
+      "q": "On AWS, where must cross-AZ durability for a database come from, and why?",
+      "a": "From the application or managed databases, because EBS volumes are replicated only within one AZ; AWS offers no cross-zone replicated EBS volume."
+    }
+  },
+  {
+    "id": "ch04-032",
+    "chapter": 4,
+    "section": "4.4 Local NVMe vs network-attached storage",
+    "title": "Local NVMe: tens of microseconds, free, and gone when you stop",
+    "body": "Instance store on AWS, or local SSD on Google and Azure, is NVMe flash physically inside the host. With no network hop, latency is tens of microseconds instead of hundreds. IOPS and throughput are very high and are not capped by a per-volume product limit or the instance's EBS bandwidth. The cost is included in the instance price. But the data is ephemeral: there is no snapshot and no detach, so the data lives and dies with that host.",
+    "deeper": "The durability rules on AWS are specific: instance store data survives a reboot, but is lost when the instance stops, hibernates or terminates, or when the underlying disk fails. That last clause matters: even without any operator action, a hardware failure destroys the data. Contrast with a network volume, which can be detached from a failed VM and attached elsewhere. The performance advantage flows directly from Little's Law. At tens of microseconds per I/O, even a modest queue depth yields enormous IOPS, and a database's single commit stream can run far faster than the roughly 2,000 commits per second allowed by 0.5 ms network latency. Throughput is limited only by the devices themselves, not by product caps or shared instance bandwidth to EBS. Being bundled into the instance price means the storage is effectively already paid for. So local NVMe offers the best performance per dollar available, but with durability that is only as good as a single machine, and that trade-off drives the whole local-versus-network decision.",
+    "quiz": {
+      "q": "On AWS, when is instance store data lost, and when does it survive?",
+      "a": "It survives a reboot, but is lost when the instance stops, hibernates or terminates, or when the underlying disk fails. There is no snapshot or detach."
+    }
+  },
+  {
+    "id": "ch04-033",
+    "chapter": 4,
+    "section": "4.4 Local NVMe vs network-attached storage",
+    "title": "The rule: go local NVMe when the app already replicates",
+    "body": "Big companies use local NVMe when the application already replicates its own data. If the software keeps three copies across three zones, losing a node just means rebuilding one replica from the others. Putting such software on network volumes, which are themselves replicated, means paying for durability twice and paying the network latency cost on every single I/O. Replicated NoSQL stores such as Cassandra and ScyllaDB fit this rule, since they replicate at the application level and are sensitive to tail latency.",
+    "deeper": "The logic is about avoiding redundant layers. Durability can be provided by the storage (replicated network volumes) or by the application (replicas on different nodes and zones). Doing both doubles cost and imposes the network hop's latency for protection the application already provides. Replicated stores like Cassandra and ScyllaDB are natural fits: they already keep multiple copies, often across zones, and they care about tail latency, which local flash reduces by removing the network path. Caches are an even easier case: flash caches, such as Meta's CacheLib, do not need durability at all, because the source of truth lives elsewhere and a lost cache can simply be refilled. The rule has a flip side, spelled out in the senior staff lens: without application-level replication, local NVMe is a data-loss incident waiting for a host failure. And even with replication, the deciding number is often rebuild time, how long you run with one fewer replica after losing a node, rather than the IOPS benchmark.",
+    "quiz": {
+      "q": "You run a three-replica Cassandra cluster across three AZs. Why is local NVMe usually better than EBS?",
+      "a": "Cassandra already replicates across AZs, so EBS replication pays for durability twice and adds network latency to every I/O. Check rebuild time before deciding."
+    }
+  },
+  {
+    "id": "ch04-034",
+    "chapter": 4,
+    "section": "4.4 Local NVMe vs network-attached storage",
+    "title": "Kafka: durability comes from replicas, not fsync",
+    "body": "Apache Kafka's documentation states that 'durability in Kafka does not require syncing data to disk, as a failed node will always recover from its replicas'. It recommends leaving application-level fsync off and relying on replication across brokers instead. Because Kafka does not depend on any single disk surviving, losing a broker's local disk is just a replica to rebuild. That design fits local NVMe well: fast, cheap local flash, with durability provided by copies on other machines.",
+    "deeper": "Kafka's stance can look reckless next to databases that treat fsync as sacred, but it follows directly from where durability lives. A Kafka message is considered safe once enough replicas on different brokers have it; if one broker crashes and loses unflushed data from its page cache, it recovers by copying from its peers. So forcing every write to disk locally would slow the system without adding real protection. PostgreSQL makes the opposite choice: committed transactions rely on the local write-ahead log being on disk, so fsync is the durability boundary and an fsync failure is fatal. Both are correct for their designs. Kafka's documentation also informs filesystem choice for its local disks: it reports XFS gave much better append latency than the best ext4 setup in its tests, 160 ms versus 250 ms and more for its 'Request Local Time' metric in a heavy test, with less variation and no special tuning, and it warns that fast ext4 mount options such as data=writeback are unsafe on power loss.",
+    "quiz": {
+      "q": "Why can Kafka recommend leaving application fsync off without giving up durability?",
+      "a": "Its durability comes from replicas on other brokers. A failed node recovers from its replicas, so local fsync is not the source of durability."
+    }
+  },
+  {
+    "id": "ch04-035",
+    "chapter": 4,
+    "section": "4.4 Local NVMe vs network-attached storage",
+    "title": "PlanetScale Metal: MySQL on local NVMe, p99 down up to 65%",
+    "body": "In March 2025, PlanetScale launched PlanetScale Metal, which runs MySQL, managed through Vitess, on locally attached NVMe instead of network volumes. It reported up to a 65% drop in p99 query latency for workloads that moved. Durability comes from database replication across servers, not from the disk. This shows the local-NVMe rule extending beyond NoSQL stores to sharded relational databases, as long as the database layer maintains its own replicas.",
+    "deeper": "PlanetScale's move is notable because relational databases have traditionally been the textbook case for durable network volumes. The difference is Vitess: a sharding and management layer for MySQL that runs each shard with replicas, so losing a node's local disk means losing one replica, not the data. With replication handling durability, network volumes would duplicate protection and add latency to every read and fsync. p99, the 99th percentile latency, captures the slowest 1% of queries, exactly where a network storage path adds variability, so a large p99 improvement is what you would expect from removing the network hop. The chapter's key takeaways list Vitess alongside Kafka and Cassandra as applications that replicate their own data and therefore suit local NVMe. The trade-off does not disappear: the team must compute rebuild time, since rebuilding a lost replica from a peer can take hours during which the shard has one fewer copy, and must have automation that detects lost replicas and rebuilds them reliably.",
+    "quiz": {
+      "q": "Why could PlanetScale safely put MySQL on ephemeral local NVMe?",
+      "a": "Vitess-managed MySQL replicates each shard across servers, so a lost node's disk is just a replica to rebuild; durability comes from database replication, not the disk."
+    }
+  },
+  {
+    "id": "ch04-036",
+    "chapter": 4,
+    "section": "4.4 Local NVMe vs network-attached storage",
+    "title": "When network volumes beat local NVMe",
+    "body": "Network block storage still wins in three situations. First, single-node databases where losing that node's data is unacceptable, since local NVMe dies with the host. Second, fast recovery: a failed VM's EBS volume can be attached to a new VM in minutes, while rebuilding 10 TB of local data from a replica can take hours. Third, elastic capacity: you can grow a network volume without changing instance type, whereas local storage size is fixed by the instance you chose.",
+    "deeper": "These cases all trace back to the lifecycle independence of network volumes. Because the volume is not tied to the host, it survives host failure (durability), can move to a replacement machine (recovery), and can change size on its own (elasticity). For a database with no application-level replica, the network volume is the durability, plus snapshots as a backstop. Even for replicated systems, recovery time can decide the question. Reattaching a volume takes minutes, and the new node starts with its data already present. Rebuilding from a peer copies terabytes across the network, often throttled to protect live traffic, and during that window the system runs with reduced redundancy. For some teams, that exposure is unacceptable. Elasticity matters for growing datasets: with local NVMe, running out of disk means moving to a larger instance type and migrating data, often paying for CPU and memory you do not need. Weigh all three against local NVMe's latency, throughput and cost advantages rather than looking at IOPS benchmarks alone.",
+    "quiz": {
+      "q": "Why might a team choose EBS over local NVMe even for a replicated database?",
+      "a": "Recovery speed: reattaching a volume to a new VM takes minutes, while rebuilding terabytes from a replica can take hours with reduced redundancy. Elastic capacity also helps."
+    }
+  },
+  {
+    "id": "ch04-037",
+    "chapter": 4,
+    "section": "4.4 Local NVMe vs network-attached storage",
+    "title": "Rebuild time: the number that really decides local vs network",
+    "body": "A back-of-envelope rebuild estimate: a 10 TB local replica is rebuilt from a peer over a 25 Gbps link, throttled to 40% of the link to protect live traffic. 25 Gbps is about 3.1 GB/s; 40% is about 1.25 GB/s. 10,000 GB divided by 1.25 GB/s is 8,000 seconds, about 2.2 hours. During those hours you run with one fewer replica. This number, not the IOPS benchmark, often decides between local and network storage.",
+    "deeper": "Each assumption is a lever. Double the data per node and rebuild time doubles, which is one reason operators cap data per node. A faster link or a higher throttle shortens the window but risks hurting live traffic, which is exactly why the throttle exists. The question to ask is not just how long, but whether running degraded for that long is acceptable. With three replicas, 2.2 hours at two copies means a second failure in that window leaves a single copy; with fewer replicas or larger nodes the risk grows. Contrast with network storage, where a failed VM's volume can be reattached in minutes with no bulk copy at all. The check-your-understanding exercise generalizes the formula: rebuild time equals data size divided by allowed rebuild bandwidth, and you should verify the degraded window is acceptable before choosing local NVMe. The key takeaways put it bluntly: always compute rebuild time. Also note the unit conversion: 25 gigabits per second divided by 8 bits per byte is about 3.1 gigabytes per second.",
+    "quiz": {
+      "q": "Before putting a replicated database on local NVMe, what number should you compute and why?",
+      "a": "Rebuild time: data size divided by allowed rebuild bandwidth. It is how long you run with one fewer replica after losing a node, and must be acceptable."
+    }
+  },
+  {
+    "id": "ch04-038",
+    "chapter": 4,
+    "section": "4.4 Local NVMe vs network-attached storage",
+    "title": "Senior staff lens: decide where durability lives, once",
+    "body": "The local-versus-network decision is really a question of where durability lives. Put durability in exactly one layer, on purpose. If the application replicates its data, local NVMe is usually faster and cheaper. If the application does not replicate, use network volumes with snapshots. The worst answer is local NVMe for a database with no replica: that is a data-loss incident waiting for a host failure, because the only copy dies with the machine.",
+    "deeper": "Framing the decision this way cuts through benchmark debates. Durability costs money and latency wherever it is implemented; implementing it twice, via replicated network volumes under a replicating database, wastes both, while implementing it zero times loses data. Exactly one layer, chosen deliberately, is the goal. Getting to 'on purpose' requires knowing facts that are easy to overlook: that EBS replicates only within one AZ and loses 0.1-0.2% of volumes per year, that instance store data vanishes when an instance stops or its disk fails, and that rebuilding a local replica can take hours. It also means documenting the choice so that later changes, such as reducing replica count to save money, do not silently remove the only durability layer. The same principle carries into Kubernetes: local persistent volumes make sense only when the application replicates itself, and operators must detect lost replicas and rebuild them. In reviews, ask the team to name the durability layer explicitly; if nobody can, there may be none.",
+    "quiz": {
+      "q": "Why is 'local NVMe for a database with no replica' the worst storage choice?",
+      "a": "Durability then lives in no layer: the only copy sits on ephemeral local flash, so any host or disk failure permanently loses the data."
+    }
+  },
+  {
+    "id": "ch04-039",
+    "chapter": 4,
+    "section": "4.5 Disaggregated storage",
+    "title": "Disaggregation: pool the flash so nothing gets stranded",
+    "body": "Disaggregation means separating storage from compute so each can scale independently. A server with 8 local SSDs strands flash when its CPU is the bottleneck, and strands CPU when its flash is full. Pool the flash on separate machines and serve it over the network, and overall utilization goes up because every workload draws from a shared pool. The cost is added network latency and a new failure domain: the network and remote storage servers can now fail independently.",
+    "deeper": "Stranding is the core economic problem. Workloads rarely need CPU and storage in exactly the ratio a server's hardware provides. A CPU-heavy service leaves its SSDs mostly empty; a data-heavy service fills its SSDs while cores sit idle. Across a large fleet, that waste adds up to a great deal of unused flash and compute. Disaggregation breaks the fixed ratio: compute nodes and storage nodes are sized and scaled separately, and any compute node can use capacity from the pool. The trade-offs are real. Every I/O now crosses a network, adding latency compared with flash on the local PCIe bus. The storage pool also becomes a dependency whose failure affects many compute nodes, a new failure domain, which is why blast radius and isolation matter so much in systems like EBS. Technologies such as NVMe over Fabrics and RDMA exist to shrink the latency penalty. The key takeaways summarize disaggregated flash as trading a small latency cost for much better utilization.",
+    "quiz": {
+      "q": "How does a server with 8 local SSDs waste resources, and how does disaggregation fix it?",
+      "a": "It strands flash when CPU is the bottleneck and strands CPU when flash is full. Pooling flash over the network lets each scale separately, raising utilization."
+    }
+  },
+  {
+    "id": "ch04-040",
+    "chapter": 4,
+    "section": "4.5 Disaggregated storage",
+    "title": "NVMe over Fabrics: a remote SSD that looks almost local",
+    "body": "NVMe over Fabrics, NVMe-oF, extends the NVMe storage protocol across a network instead of only a local PCIe bus. It can run over RDMA, TCP or Fibre Channel. The result is that a remote SSD looks almost like a local one to the host, typically adding only a small amount of latency on a good network. NVMe-oF is one of the key enabling technologies for disaggregated storage, because it narrows the performance gap between local and pooled flash.",
+    "deeper": "NVMe was designed for fast flash, with many deep queues that map well to modern multi-core CPUs, in contrast to older storage protocols built around spinning disks. Extending the same protocol over a network means the host uses the same command model whether the SSD is inside the machine or in a remote chassis, avoiding translation layers that add latency. The transport choice shapes performance. RDMA, remote direct memory access, lets network cards move data directly into memory without involving the remote CPU, giving the lowest latency. TCP runs on ordinary Ethernet and is easier to deploy but costs more CPU and latency. Fibre Channel fits existing storage-area-network environments. The phrase 'on a good network' is doing work: congestion and tail latency on the fabric erode the near-local illusion, which is why AWS invested in SRD and why Alibaba's Pangu moved from 25 Gbps to 100 Gbps RDMA. AWS EBS on Nitro achieves a similar effect with its own design, presenting a remote volume to the guest as a local NVMe device.",
+    "quiz": {
+      "q": "What does NVMe-oF change about where an NVMe SSD can live, and what is the cost?",
+      "a": "It carries the NVMe protocol over a network (RDMA, TCP, Fibre Channel), so a remote SSD appears almost local, at the cost of a small added latency."
+    }
+  },
+  {
+    "id": "ch04-041",
+    "chapter": 4,
+    "section": "4.5 Disaggregated storage",
+    "title": "Meta Lightning: a JBOF chassis of 15 to 30 SSDs per tray",
+    "body": "In 2016, Meta published Lightning, an NVMe JBOF, meaning 'just a bunch of flash': a chassis holding 15 SSDs per tray, or 30 with PCIe bifurcation, connected to a head node with PCIe cables. Meta's stated goal was to scale flash across applications and to tune the compute-to-storage ratio. Rather than fixing the number of SSDs inside every server, Lightning let Meta attach flash in bulk and match it to what each workload actually needed.",
+    "deeper": "Lightning is disaggregation at the hardware level. A JBOF contains drives but little or no general-purpose compute of its own; a head node connected over PCIe cables provides the processing and serves the flash. PCIe bifurcation, splitting a wide PCIe link into several narrower ones, lets the same tray connect twice as many drives, 30 instead of 15, trading per-drive bandwidth for density. The benefit is flexibility in the compute-to-storage ratio: applications that need lots of flash relative to CPU get it without buying servers full of idle cores, directly attacking the stranding problem. Meta's broader stance, described in the chapter's In industry note, is to use both approaches in its own fleet: local flash where latency matters most, such as flash caches like CacheLib, and disaggregated flash where utilization matters most. That balanced approach contrasts with public clouds, where disaggregation is the default because providers gain utilization across millions of customers. Lightning shows that disaggregation need not mean a network fabric; even PCIe-attached chassis can decouple flash from compute.",
+    "quiz": {
+      "q": "What problem was Meta's Lightning JBOF designed to solve?",
+      "a": "Fixed flash per server strands resources. Lightning let Meta scale flash across applications and tune the compute-to-storage ratio by attaching trays of SSDs to head nodes."
+    }
+  },
+  {
+    "id": "ch04-042",
+    "chapter": 4,
+    "section": "4.5 Disaggregated storage",
+    "title": "Alibaba Pangu: user-space storage and RDMA for sub-ms cloud disks",
+    "body": "Pangu is Alibaba's unified storage platform, in development since 2009, underneath Alibaba Cloud's Elastic Block Storage, object storage, NAS and PolarDB. A FAST 2023 paper describes Pangu 2.0 embracing SSDs and RDMA, and building a user-space storage operating system that uses a run-to-completion model to avoid kernel data copies and interrupts, aiming at 100-microsecond-level I/O latency. The paper reports P999 latency under 1 ms for its EBS cloud disk.",
+    "deeper": "Pangu shows what it takes to make disaggregated storage fast. Once flash and network are fast, the software stack becomes the bottleneck: kernel data copies, context switches and interrupts each add microseconds. Pangu 2.0 moved storage processing into a user-space operating system. In a run-to-completion model, a thread takes a request and processes it all the way through without handing it off or waiting on interrupts, cutting overhead and variability. RDMA lets network cards place data directly into memory, avoiding the remote CPU. Pangu later upgraded storage servers from 25 Gbps to 100 Gbps RDMA and added techniques to reduce traffic amplification, the extra network traffic generated by replication and internal data movement beyond the user's own bytes. The reported result, P999 latency under 1 ms for its EBS cloud disk, is notable because P999 captures the slowest 0.1% of I/Os, exactly where disaggregated storage usually suffers. Like Google's use of Colossus, Pangu is a single shared substrate beneath multiple storage products rather than a dedicated block system.",
+    "quiz": {
+      "q": "Why did Pangu 2.0 build a user-space storage stack with run-to-completion processing?",
+      "a": "With fast SSDs and RDMA, kernel copies and interrupts became the latency bottleneck. User-space run-to-completion avoids them, targeting 100-microsecond-level I/O."
+    }
+  },
+  {
+    "id": "ch04-043",
+    "chapter": 4,
+    "section": "4.5 Disaggregated storage",
+    "title": "In industry: clouds disaggregate, Meta uses both",
+    "body": "Disaggregation is the default in public clouds, including AWS EBS, Google Persistent Disk and Alibaba's Pangu-backed EBS, because the provider gains utilization across millions of customers. EBS itself is disaggregated storage: the Nitro card presents a remote volume to the VM as local NVMe. Inside their own fleets, companies like Meta use both models: local flash where latency matters most, and disaggregated flash where utilization matters most. There is no single right answer, only a trade-off to choose deliberately.",
+    "deeper": "The economics explain the cloud default. A provider serving millions of customers faces extreme variation in how much storage each VM needs; pooling flash lets it sell exactly the capacity and performance each customer buys while keeping the hardware busy. It also enables the features customers value in network volumes: detach and reattach, snapshots, resizing and survival beyond a single host. Companies running their own infrastructure face a different calculation. They know their workloads, so they can place latency-critical services, such as flash caches or replicated databases, on local flash, and use disaggregated pools for workloads where utilization and flexibility matter more. That mirrors the application-level guidance from the local-versus-network section: if the software replicates and needs low latency, go local; otherwise pooled or network storage buys flexibility. The key takeaways frame disaggregated flash, including NVMe-oF, Meta Lightning and Alibaba Pangu with RDMA and a user-space storage stack, as trading a small latency cost for much better utilization.",
+    "quiz": {
+      "q": "Why is disaggregated storage the default for public clouds specifically?",
+      "a": "Pooling flash across millions of customers maximizes utilization and enables network-volume features like detach, snapshots and resizing, which outweighs the small latency cost."
+    }
+  },
+  {
+    "id": "ch04-044",
+    "chapter": 4,
+    "section": "4.6 Filesystems on the node, and why databases care",
+    "title": "ext4 vs XFS: why Kafka's docs prefer XFS",
+    "body": "ext4 and XFS are the two common Linux filesystems for data. Both are journaling filesystems: they log metadata changes before applying them, so a crash does not corrupt the directory structure. XFS was designed for large files and parallel I/O. Kafka's documentation reports XFS gave much better append latency than the best ext4 setup in its tests, 160 ms versus 250 ms and more for 'Request Local Time' in a heavy test, with less variation and no special tuning.",
+    "deeper": "Journaling is the reason a machine can lose power without leaving the filesystem unusable. Before changing metadata such as directory entries or allocation maps, the filesystem writes the intended change to a journal; after a crash, it replays or discards journal entries to return to a consistent structure. Note that journaling protects metadata structure by default, not necessarily your file contents, which is why applications still need fsync. Kafka's findings matter because Kafka's workload, heavy sequential appends across many partitions, resembles many log-structured systems. XFS's design for parallel I/O and large files delivered lower and more consistent append latency. The Kafka docs also contain an important warning: the ext4 mount options that make ext4 fast, such as data=writeback, are unsafe on power loss. Those options relax the ordering between data and metadata writes, which can leave files pointing at garbage after a crash. The broader lesson is that filesystem tuning for speed can quietly trade away safety, so treat any performance-oriented mount option as a durability decision too.",
+    "quiz": {
+      "q": "Why is tuning ext4 with data=writeback to match XFS's speed a risky idea?",
+      "a": "Kafka's docs warn such fast ext4 mount options are unsafe on power loss; they relax write ordering, risking corrupted data after a crash. XFS needs no such tuning."
+    }
+  },
+  {
+    "id": "ch04-045",
+    "chapter": 4,
+    "section": "4.6 Filesystems on the node, and why databases care",
+    "title": "write() isn't durable. fsync() is.",
+    "body": "By default, a write() call only copies data into the kernel's page cache in memory. The kernel writes it to the disk later, at a time of its choosing. If the machine loses power before that, the data is gone even though write() returned successfully. To make data durable, an application calls fsync(), which forces the file's dirty pages and metadata to stable storage and waits until that is done. Only after fsync returns is the data safe.",
+    "deeper": "The page cache exists for performance: buffering writes in memory lets the kernel combine them, reorder them and write efficiently in the background, and it lets reads of recently used data come from RAM. The cost is a gap between what the application thinks it wrote and what is actually on disk. Dirty pages, modified in memory but not yet written, are the vulnerable window. fsync closes the window for a given file by flushing its dirty data and the metadata needed to find it, then blocking until the storage confirms. This is why the chapter opens with the requirement that a write be safe once fsync returns: that promise is the foundation every database builds on. It also explains crash-consistent snapshots, which capture what is on the volume but not what is still in the page cache. And it explains the price of durability: every fsync waits for at least one full storage round trip, which ties database commit rates directly to storage latency.",
+    "quiz": {
+      "q": "An application's write() returned success, then power failed. Why might the data be lost?",
+      "a": "write() only copied data into the kernel page cache. Without fsync forcing dirty pages to stable storage, unflushed data vanishes on power loss."
+    }
+  },
+  {
+    "id": "ch04-046",
+    "chapter": 4,
+    "section": "4.6 Filesystems on the node, and why databases care",
+    "title": "Commit rate is capped by fsync latency, hence group commit",
+    "body": "A database commit is safe only after its write-ahead log record has been fsync'd, so every commit pays at least one storage round trip. With 0.5 ms network latency, a single commit stream cannot exceed about 2,000 commits per second. With local NVMe at tens of microseconds, the ceiling is much higher. This is why databases batch commits, a technique called group commit: many transactions share one fsync, so the round-trip cost is spread across them.",
+    "deeper": "This is Little's Law applied to durability. If each commit must wait for an fsync of 0.5 ms before the next in the same stream can proceed, the stream completes at most 1 / 0.0005 = 2,000 commits per second, regardless of how many IOPS the volume is provisioned for. Two responses exist, mirroring the fixes for any latency-bound workload. Group commit is the parallelism route: while one fsync is in flight, other transactions queue up, and the next fsync flushes all their WAL records at once, turning many commits into one I/O. The cost is slightly higher latency per commit in exchange for much higher throughput. The other route is lower latency: local NVMe at tens of microseconds raises the ceiling by an order of magnitude, one reason latency-sensitive databases move to local disks. The key takeaways summarize it: databases live or die by fsync, and commit rate is bounded by fsync latency. It also explains why benchmarks with fsync disabled wildly overstate real commit rates.",
+    "quiz": {
+      "q": "With 0.5 ms storage latency, why can't a single commit stream exceed about 2,000 commits/s, and what helps?",
+      "a": "Each commit waits for one WAL fsync round trip: 1/0.0005 = 2,000. Group commit shares one fsync across many transactions; lower-latency storage raises the ceiling."
+    }
+  },
+  {
+    "id": "ch04-047",
+    "chapter": 4,
+    "section": "4.6 Filesystems on the node, and why databases care",
+    "title": "PostgreSQL's 2018 fsync surprise: errors that vanish",
+    "body": "In 2018 the PostgreSQL community found that on Linux, when a background write-back of dirty pages fails, the kernel can mark those pages clean and drop the data. A later fsync, possibly from another process, may not report the error at all. The data is silently lost. PostgreSQL's response was to treat any fsync failure as fatal, panicking and recovering from its write-ahead log, instead of retrying. The lesson: after an fsync error, you cannot trust the page cache.",
+    "deeper": "The intuitive way to handle a failed fsync is to retry until it succeeds. The 2018 discovery showed why that is dangerous on Linux. When the kernel's background write-back fails, it may mark the affected pages clean even though they never reached disk, and discard the error. A retried fsync then succeeds, because from the kernel's view nothing is dirty, and the application believes its data is durable when it is actually gone. The error might also be reported to a different process than the one that later calls fsync. PostgreSQL relies on its local WAL and data files being truly on disk for committed transactions, so it chose the only safe action: PANIC, crash the database, and on restart replay the WAL, which rebuilds state from records known to be durable, rather than trusting whatever the page cache holds. Kernel developers pointed to direct I/O as the long-term answer, since it avoids relying on the page cache's write-back behavior. Contrast Kafka, which relies on replicas rather than local fsync for durability.",
+    "quiz": {
+      "q": "Why did PostgreSQL decide to crash on fsync failure rather than retry the fsync?",
+      "a": "On Linux a failed write-back can mark pages clean and drop data, so a retried fsync may succeed falsely. Crashing and replaying the WAL is the only safe recovery."
+    }
+  },
+  {
+    "id": "ch04-048",
+    "chapter": 4,
+    "section": "4.6 Filesystems on the node, and why databases care",
+    "title": "Direct I/O: databases that skip the page cache entirely",
+    "body": "With O_DIRECT, reads and writes bypass the kernel's page cache and go straight to the storage device. Databases that manage their own buffer pool, such as MySQL InnoDB as it is commonly configured, use direct I/O for two reasons: to avoid caching the same data twice, once in the database's buffer pool and again in the kernel, and to control exactly when writes reach the disk. Kernel developers pointed to direct I/O as the long-term answer to the fsync problem.",
+    "deeper": "A database with its own buffer pool already decides which pages to keep in memory, based on knowledge the kernel lacks, such as which index pages are hot or which pages belong to an uncommitted transaction. Letting the kernel also cache those pages wastes memory on duplicates and adds another layer that decides when data is written. With O_DIRECT, the database's writes go to the device on its own schedule, so its durability logic does not depend on the page cache's write-back behavior. That is why kernel developers, discussing PostgreSQL's 2018 fsync discovery, pointed to direct I/O as the long-term answer: if data never sits in the page cache, the kernel cannot silently drop it after a failed write-back. The trade-off is responsibility: the application must do its own caching well and issue I/O efficiently, often with enough parallelism to satisfy Little's Law, since it loses the kernel's readahead and write combining. Databases without a sophisticated buffer pool generally benefit from the page cache instead.",
+    "quiz": {
+      "q": "Why would a database with its own buffer pool open its files with O_DIRECT?",
+      "a": "To avoid caching data twice (buffer pool plus page cache) and to control exactly when writes reach disk instead of relying on kernel write-back."
+    }
+  },
+  {
+    "id": "ch04-049",
+    "chapter": 4,
+    "section": "4.6 Filesystems on the node, and why databases care",
+    "title": "Common mistake: sizing production from an fsync-off benchmark",
+    "body": "A common error is benchmarking a database on a volume where a write cache is 'helping', or with fsync disabled, and then sizing production from the resulting number. Those settings skip the storage round trip that every real commit must pay, so the benchmark wildly overstates throughput. Your real commit rate is bounded by fsync latency on the real storage. Always benchmark with the exact durability settings you will run in production, or the capacity plan will fail under load.",
+    "deeper": "The trap is that disabling durability makes numbers look spectacular. Without fsync, commits complete as soon as data is in memory, so the benchmark measures memory speed rather than storage speed. With fsync on, each commit stream is capped by storage latency: about 2,000 commits per second per stream at 0.5 ms network latency, before group commit. A plan sized on the inflated figure might provision a fraction of the needed servers, and the gap only appears when production traffic arrives. Write caches create a subtler version of the same problem: if a cache acknowledges writes before they are on stable storage, the benchmark is fast but may not reflect what the production storage path does, or may not be power-safe. The same principle applies to filesystem options such as ext4's data=writeback, which Kafka's documentation warns is unsafe on power loss. The rule generalizes: a performance number is only meaningful alongside the durability guarantees it was measured with, so benchmark the configuration you will actually run.",
+    "quiz": {
+      "q": "Why does a benchmark with fsync disabled lead to under-provisioned production databases?",
+      "a": "It skips the storage round trip each real commit pays, so it measures memory speed. Real commit rate is bounded by fsync latency on the actual storage."
+    }
+  },
+  {
+    "id": "ch04-050",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "Kubernetes was built for stateless pods; data breaks that",
+    "body": "Kubernetes was designed around stateless pods: if one dies, kill it and start another anywhere in the cluster. Storage breaks that model, because data lives in one place, on a particular volume or disk, and a replacement pod needs to find exactly that data again. Kubernetes solves this with a set of abstractions, PersistentVolumes, PersistentVolumeClaims, StorageClasses, CSI drivers, snapshots, StatefulSets and operators, that give stateful workloads durable disks inside a system built for disposable containers.",
+    "deeper": "For stateless services, the scheduler's freedom to place a pod on any node is a feature: it enables bin packing, rolling upgrades and self-healing. Stateful workloads constrain that freedom. A database pod must be reunited with its volume, and that volume may be zonal, like an EBS volume that cannot leave its Availability Zone, or local, tied to a single node's NVMe. Moving it takes time, may be impossible across zones, or may mean data loss with local disks. The abstractions in this section each address part of the problem: claims and classes separate what an application asks for from how storage is provided; CSI drivers connect Kubernetes to real storage systems; binding modes keep volumes and pods in the same zone; StatefulSets give pods stable identities that map to stable volumes; and operators encode the database-specific operations Kubernetes knows nothing about. The section ends with the operational risks, because running databases on Kubernetes works, but its failure modes differ from stateless apps and must be designed for.",
+    "quiz": {
+      "q": "Why does persistent storage conflict with Kubernetes' original design model?",
+      "a": "Kubernetes assumes a failed pod can be restarted anywhere. Data lives in one place, so a replacement pod must reach that specific volume, constraining scheduling."
+    }
+  },
+  {
+    "id": "ch04-051",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "PV and PVC: the storage and the request for it",
+    "body": "A PersistentVolume, or PV, is a piece of storage in the cluster, such as an EBS volume, a Persistent Disk, a local disk or an NFS share. Its lifecycle is independent of any pod. A PersistentVolumeClaim, or PVC, is a user's request for storage, for example 'I need 100 GiB, ReadWriteOnce, class fast-ssd'. The Kubernetes control plane binds each PVC to one PV, one-to-one, and the pod then mounts the claim rather than the underlying storage.",
+    "deeper": "The split mirrors a common pattern: separate what you need from how it is provided. Application authors write PVCs describing size, access mode and class, without knowing whether the cluster runs on AWS, Google Cloud or bare metal. Cluster administrators or automated provisioners supply PVs that satisfy those requests. The one-to-one binding means a claimed volume belongs to that claim until released, so two unrelated workloads cannot accidentally share a disk. Because a PV's lifecycle is independent of pods, a pod can die and be replaced while its claim, and therefore its data, persists; the replacement simply mounts the same PVC. What happens to the PV when the claim itself is deleted depends on the reclaim policy, Delete or Retain. The analogy used later for snapshots follows the same shape: a VolumeSnapshot is a user's request like a PVC, and a VolumeSnapshotContent is the actual snapshot like a PV. Understanding this request-versus-resource split makes the rest of Kubernetes storage much easier to follow.",
+    "quiz": {
+      "q": "Why does Kubernetes separate PersistentVolumeClaims from PersistentVolumes?",
+      "a": "Apps request storage (size, access mode, class) without knowing the backend, while PVs represent actual storage. Binding one-to-one lets data outlive pods and keeps apps portable."
+    }
+  },
+  {
+    "id": "ch04-052",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "StorageClass and dynamic provisioning: volumes on demand",
+    "body": "A StorageClass describes a kind of storage, which provisioner creates it, and with what parameters, for example EBS gp3 with 6,000 IOPS. With dynamic provisioning, when a PVC names a StorageClass and no existing PV matches, the provisioner creates a brand-new volume on demand. No administrator has to pre-create disks. An example class named db-gp3 uses provisioner ebs.csi.aws.com with type gp3, 6,000 IOPS, 500 MiB/s throughput, reclaimPolicy Retain, WaitForFirstConsumer binding and volume expansion allowed.",
+    "deeper": "Without dynamic provisioning, administrators would have to guess ahead of time how many volumes of which sizes to create, and users would wait for them. StorageClasses make storage self-service: a team writes a PVC referencing a class, and the provisioner calls the cloud API to create a volume matching the class's parameters. The db-gp3 example encodes several good production choices in one object. Parameters set the EBS type and provision IOPS and throughput separately, taking advantage of gp3's independent performance knobs. reclaimPolicy: Retain keeps the cloud volume when the claim is deleted, protecting against accidental data loss. volumeBindingMode: WaitForFirstConsumer delays creating the volume until a pod is scheduled, so a zonal EBS volume lands in the pod's zone. allowVolumeExpansion: true lets claims grow later, using the elastic capacity of network volumes. A cluster typically offers several classes, for example a cheap general class and a high-performance database class, and each PVC chooses one by name.",
+    "quiz": {
+      "q": "What does dynamic provisioning do when a PVC names a StorageClass and no PV matches?",
+      "a": "The StorageClass's provisioner creates a new volume on demand with the class's parameters, so no one has to pre-create disks."
+    }
+  },
+  {
+    "id": "ch04-053",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "Access modes: one node, many readers, many writers, or one pod",
+    "body": "Kubernetes volumes declare access modes. ReadWriteOnce means the volume can be mounted read-write by one node. ReadOnlyMany means many nodes can mount it read-only. ReadWriteMany means many nodes can mount it read-write, which usually requires a shared filesystem. ReadWriteOncePod restricts read-write access to exactly one pod. The mode must match what the underlying storage can do: a typical cloud block volume supports ReadWriteOnce, while ReadWriteMany normally needs a network filesystem.",
+    "deeper": "Access modes reflect the nature of the storage underneath. A block device has no locking or coordination between writers, so two machines writing the same block volume independently would corrupt each other's filesystem. That is why block volumes such as EBS are typically ReadWriteOnce. ReadWriteMany workloads, such as shared content directories used by many pods, are usually backed by managed network filesystems like Amazon EFS, Google Filestore or Azure Files, which implement POSIX semantics across many clients. ReadWriteOncePod is stricter than ReadWriteOnce. ReadWriteOnce is per node, so two pods on the same node could both mount the volume; ReadWriteOncePod guarantees only one pod can, which is valuable for databases that must never have two instances writing the same data files. ReadOnlyMany suits distributing static data, such as reference datasets, to many nodes. Choosing the right mode is a correctness decision, not just a capability check: pick the most restrictive mode your workload allows.",
+    "quiz": {
+      "q": "Why is ReadWriteOncePod safer than ReadWriteOnce for a database volume?",
+      "a": "ReadWriteOnce limits access to one node, so two pods on that node could both write. ReadWriteOncePod guarantees only a single pod can mount it read-write."
+    }
+  },
+  {
+    "id": "ch04-054",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "Reclaim policy: Retain is the safer default for databases",
+    "body": "A PersistentVolume's reclaim policy decides what happens to the underlying storage when its claim is deleted. With Delete, the cloud volume is removed along with the PVC. With Retain, the volume is kept for manual cleanup, so the data still exists even after the claim is gone. For production databases, Retain is often the safer choice, because a mistaken deletion of a claim, or of a whole namespace, would otherwise destroy the data permanently.",
+    "deeper": "Delete is convenient for ephemeral environments: test clusters and preview deployments clean up after themselves automatically, and nobody pays for orphaned disks. But in production, convenience cuts the wrong way. The chapter's list of operational risks includes accidental deletion: a kubectl delete namespace can remove every PVC in that namespace, and with a Delete reclaim policy the cloud volumes go too, taking the database with them. Retain breaks that chain: Kubernetes objects can be deleted and recreated, but the volume, and the data, stays until a human deliberately removes it. The cost is housekeeping, since retained volumes must be tracked and cleaned up manually or they accumulate charges. Retain is one layer of defense, not the whole plan. The chapter recommends combining it with deletion protection and off-cluster backups, since snapshots and volumes inside the same account or cluster can still be lost to broader mistakes. The example db-gp3 StorageClass sets reclaimPolicy: Retain for exactly this reason.",
+    "quiz": {
+      "q": "What happens to a database's data after 'kubectl delete namespace' under Delete vs Retain reclaim policies?",
+      "a": "With Delete, PVCs are removed and their cloud volumes deleted, destroying data. With Retain, the volumes remain for manual recovery or cleanup."
+    }
+  },
+  {
+    "id": "ch04-055",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "WaitForFirstConsumer: keep the volume in the pod's zone",
+    "body": "The volumeBindingMode setting WaitForFirstConsumer delays creating a volume until a pod that uses it has been scheduled, so the volume is created in the same zone as that pod. Without it, using Immediate binding, a zonal EBS volume might be created in zone A while the scheduler later places the pod in zone B. Because the volume cannot attach across zones, the pod can never start and stays stuck in a pending state.",
+    "deeper": "The root cause is ordering. With Immediate binding, the provisioner creates the volume as soon as the PVC appears, choosing a zone before the scheduler has considered the pod's constraints, such as available CPU, memory, node affinity or anti-affinity with other replicas. Since zonal block volumes, like EBS, cannot move to another Availability Zone, any mismatch is permanent for that pod: the scheduler cannot place it where the volume lives if that zone lacks capacity, and it cannot use the volume anywhere else. WaitForFirstConsumer reverses the order: schedule the pod first, taking all constraints into account, then create the volume in the chosen zone. The Kubernetes docs also recommend WaitForFirstConsumer for local persistent volumes, where the same reasoning applies at node level instead of zone level. The key takeaways sum it up: WaitForFirstConsumer keeps volumes in the right zone. It is a small setting with an outsized effect on whether stateful pods start reliably.",
+    "quiz": {
+      "q": "What goes wrong if a StorageClass for zonal EBS volumes uses Immediate binding?",
+      "a": "The volume may be created in one zone before the pod is scheduled. If the pod lands in another zone, it cannot attach the volume and stays pending."
+    }
+  },
+  {
+    "id": "ch04-056",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "CSI drivers: how Kubernetes actually talks to storage",
+    "body": "The Container Storage Interface, CSI, is a standard API between container orchestrators and storage systems. Before CSI, storage plugins were compiled into Kubernetes itself. Now each vendor ships a CSI driver, such as the EBS CSI driver, the GCE PD driver or Ceph's driver, that runs as pods in the cluster. A driver has a controller part, which creates, deletes, attaches and snapshots volumes through the cloud API, and a node part, which formats and mounts the device on the host.",
+    "deeper": "Moving storage plugins out of the Kubernetes codebase decoupled vendors from Kubernetes release cycles: a storage provider can fix bugs or add features by shipping a new driver, without waiting for a Kubernetes release. The full provisioning flow shows how the pieces fit. A PVC requests 100Gi of class db-gp3. The StorageClass names the EBS CSI provisioner. With WaitForFirstConsumer, the pod is scheduled onto a node first; then the CSI controller calls the cloud API to create a new EBS volume in the pod's zone. The resulting PV is bound to the PVC. The CSI node plugin on the chosen node attaches the device, formats it with a filesystem if needed and mounts it, and the container sees it at a path such as /var/lib/db. The controller-versus-node split matches the work: cloud API calls happen once, centrally, while formatting and mounting must happen on the specific host. Volume snapshots in Kubernetes also depend on CSI drivers.",
+    "quiz": {
+      "q": "What is the division of labor between a CSI driver's controller part and node part?",
+      "a": "The controller calls the storage/cloud API to create, delete, attach and snapshot volumes; the node part formats and mounts the device on the host running the pod."
+    }
+  },
+  {
+    "id": "ch04-057",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "Kubernetes snapshots mirror the PV/PVC pattern",
+    "body": "Kubernetes models volume snapshots with three objects. VolumeSnapshot is a user's request, like a PVC. VolumeSnapshotContent is the actual snapshot, like a PV. VolumeSnapshotClass holds driver parameters, like a StorageClass. They are custom resource definitions, work only with CSI drivers, and require a snapshot controller to be installed. Snapshots are crash-consistent by default. A new PVC can be created from a snapshot, or cloned directly from another existing PVC.",
+    "deeper": "Mirroring the familiar PV/PVC/StorageClass trio makes snapshots easy to reason about: users ask for a snapshot without knowing how the backend takes it, and the driver produces an actual snapshot object bound to that request. Because the objects are CRDs rather than core built-in types, clusters need the snapshot CRDs and a snapshot controller installed, and the storage must use a CSI driver that supports snapshots; older in-tree plugins do not. Crash consistency carries over from the underlying cloud snapshot: the snapshot captures volume blocks at an instant, missing any data still in the page cache, and a restored database must replay its write-ahead log as after a crash. If you need application consistency, freeze the filesystem or have the database checkpoint before snapshotting, typically coordinated by an operator. Creating PVCs from snapshots or cloning PVCs enables useful workflows: restoring after a bad migration, standing up a copy of production data for testing, or seeding a new replica faster than copying over the network.",
+    "quiz": {
+      "q": "Which Kubernetes snapshot object plays the role of a PVC, and which plays the role of a PV?",
+      "a": "VolumeSnapshot is the user's request, like a PVC; VolumeSnapshotContent is the actual snapshot, like a PV. VolumeSnapshotClass parallels a StorageClass."
+    }
+  },
+  {
+    "id": "ch04-058",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "StatefulSets: db-1 always comes back as db-1, with its disk",
+    "body": "A StatefulSet runs pods that need stable identity. Each pod gets a stable name, such as db-0, db-1 and db-2, a stable network identity, and its own PVC created from a volumeClaimTemplate. If db-1 dies, its replacement is also named db-1 and reattaches the same PVC, so it finds its own data. Pods are created and updated in order. By default, deleting or scaling down a StatefulSet does not delete its PVCs, so data survives mistakes.",
+    "deeper": "Stable identity is what distributed databases need. Replicas are not interchangeable: db-0 may be the primary, db-1 and db-2 replicas, each with its own copy of the data and a known address that peers and clients use. A regular Deployment would give replacements random names and no persistent per-pod storage, breaking those assumptions. The volumeClaimTemplate automatically creates a separate PVC per pod, such as one for db-0 and one for db-1, and binds each to the same-numbered pod forever. Ordered creation and updates matter for systems that must bootstrap in sequence or should only upgrade one member at a time. Keeping PVCs after deletion or scale-down is a safety choice: if someone accidentally scales from three to one, the data for db-1 and db-2 is still there when they scale back up. The limitation is important: StatefulSets manage identity and storage, not database logic. They cannot promote a replica, rebuild one or run backups, which is why operators exist.",
+    "quiz": {
+      "q": "If StatefulSet pod db-1 dies, what happens to its identity and data?",
+      "a": "The replacement pod is also named db-1, keeps the same network identity and reattaches the same PVC, so it finds the same data."
+    }
+  },
+  {
+    "id": "ch04-059",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "What a StatefulSet does not do: it knows nothing about your database",
+    "body": "A StatefulSet gives pods stable names and stable storage, but it knows nothing about the database running inside them. It will not promote a replica to primary when the primary fails. It will not rebuild a lost replica. It will not run backups. It will not perform a safe rolling upgrade that waits for replication to catch up before moving to the next pod. All of that database-specific operational knowledge must come from somewhere else, usually an operator.",
+    "deeper": "This gap is where many teams underestimate the effort of running databases on Kubernetes. A StatefulSet's rolling update, for example, restarts pods in order, but it only knows whether a pod is running, not whether the replica inside has caught up with the primary. Restarting the next pod too early could leave the cluster with too few up-to-date copies. Similarly, if the primary pod's node dies, the StatefulSet will try to bring back the same-named pod with the same volume, which for a zonal or local volume may be slow or impossible, rather than promoting an existing replica. Backups, including consistency coordination such as checkpointing before snapshots, are simply outside its scope. These tasks are exactly what a human database administrator used to do, and on Kubernetes they must be automated for it to work well at scale. The chapter's next section introduces operators, controllers that encode that knowledge, and the senior staff lens asks whether the team has an operator it trusts and has practiced failures with.",
+    "quiz": {
+      "q": "Why is a StatefulSet's ordered rolling update not enough to safely upgrade a replicated database?",
+      "a": "It only knows whether pods are running, not whether replication has caught up, so it may restart the next member before data is safely replicated."
+    }
+  },
+  {
+    "id": "ch04-060",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "Local persistent volumes: fast NVMe, pinned to one node",
+    "body": "A local PersistentVolume exposes a node's local disk, for example NVMe flash, as a PV. It requires node affinity, so a pod using it can only run on that node. Local PVs do not support dynamic provisioning in core Kubernetes, and if the node fails, the pod cannot move elsewhere and the data may be lost. The Kubernetes docs recommend WaitForFirstConsumer binding for them. Local PVs make sense only when the application replicates its own data.",
+    "deeper": "Local PVs bring the local-versus-network trade-off into Kubernetes. The benefit is local NVMe's performance: tens of microseconds of latency and very high IOPS, with no per-volume product caps. The costs are the same as outside Kubernetes but more visible. Node affinity pins the pod, so the scheduler loses its usual freedom; if the node dies or is replaced, the pod cannot be rescheduled with its data, and node replacement effectively means data loss for that replica. Without dynamic provisioning in core Kubernetes, local PVs must be pre-created or managed by additional tooling. WaitForFirstConsumer is recommended because the scheduler must weigh the pod's other constraints together with the location of available local disks before binding. The chapter explicitly ties this back to the rule from the local-versus-network section: use local storage only when the application replicates itself. The operational risk list adds that automation must detect a lost local replica and rebuild it, ideally within a computed, acceptable rebuild window.",
+    "quiz": {
+      "q": "When is a Kubernetes local PersistentVolume a reasonable choice for a database?",
+      "a": "Only when the database replicates its own data, since the pod is pinned to one node and losing that node loses the replica's data."
+    }
+  },
+  {
+    "id": "ch04-061",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "Operators: putting the DBA's playbook into code",
+    "body": "An operator is a Kubernetes controller that encodes operational knowledge for one specific system: how to bootstrap it, add a replica, fail over, back up and upgrade. It fills exactly the gap StatefulSets leave. Where a StatefulSet only keeps pods and volumes stable, an operator understands the database inside, so it can promote a replica when the primary dies, rebuild lost replicas, run backups and perform rolling upgrades that wait for replication health.",
+    "deeper": "Operators follow the Kubernetes pattern of reconciling actual state toward desired state, but with domain logic. A database operator might watch a custom resource that declares 'a three-replica cluster, version X, daily backups', then continuously act to make that true: creating the StatefulSet, checking replication lag, failing over when the primary is unreachable, triggering snapshots after asking the database to checkpoint, and coordinating upgrades one member at a time. It also handles the Kubernetes-specific risks the chapter lists. During node drains, it should wait for replication health before allowing the next drain. If a volume detach is stuck, it should fail over to a replica rather than wait. With local PVs, it should detect a lost replica and rebuild it. In short, the operator is where the DBA's playbook lives as code. The quality of that code determines whether running databases on Kubernetes is safe, which is why the senior staff lens asks whether the team trusts its operator and has practiced failures with it.",
+    "quiz": {
+      "q": "What does an operator do that a StatefulSet does not?",
+      "a": "It encodes system-specific operations: bootstrapping, promoting a replica on failure, rebuilding lost replicas, running backups and rolling upgrades that wait for replication health."
+    }
+  },
+  {
+    "id": "ch04-062",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "Rook: a CNCF-graduated operator that runs Ceph on Kubernetes",
+    "body": "Rook is a CNCF graduated operator for Ceph, the open-source distributed storage system. It automates deploying, configuring, scaling, upgrading and monitoring Ceph clusters on Kubernetes. Through Ceph, it provides three kinds of storage to other pods: block storage via RBD, file storage via CephFS, and object storage via RGW. Rook's Ceph operator was declared stable in December 2018, making it a mature example of encoding a complex storage system's operations in software.",
+    "deeper": "Rook shows operators managing not just a database but a whole storage platform. Ceph is powerful but operationally demanding: it has many daemons, placement rules, failure handling and upgrade procedures. Rook turns those procedures into automation, so a team can run Ceph as a set of Kubernetes resources and let the operator handle deployment, scaling and upgrades. Once running, Ceph becomes a storage provider for the rest of the cluster: pods can claim RBD block volumes much like cloud volumes, share CephFS filesystems for ReadWriteMany needs, or use RGW's object interface. Ceph's own CSI driver, mentioned among the examples of vendor drivers, connects those volumes to pods through the standard interface. This pattern suits organizations running Kubernetes on their own hardware, where no cloud block storage exists, letting them build a disaggregated storage pool from local disks across nodes. The December 2018 stability milestone gives a sense of how long the approach has been proven.",
+    "quiz": {
+      "q": "What three storage interfaces does Rook-managed Ceph provide to other pods?",
+      "a": "Block storage via RBD, file storage via CephFS, and object storage via RGW."
+    }
+  },
+  {
+    "id": "ch04-063",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "HubSpot and Vitess: 1,000+ MySQL clusters on Kubernetes",
+    "body": "Vitess, the MySQL sharding and management system, has a Kubernetes operator. HubSpot adopted Vitess on Kubernetes from mid-2016. A 2019 CNCF case study says HubSpot built the first Vitess operator and had run it in production for about two years, and its engineers said Vitess let them unify data storage and microservices infrastructure on Kubernetes. By 2023, HubSpot reported running over a thousand MySQL clusters per environment on Vitess.",
+    "deeper": "HubSpot's story demonstrates that the operator pattern can carry serious relational workloads at scale. Before operators, companies typically ran databases on dedicated VMs managed by separate tooling, while applications ran on Kubernetes, creating two operational worlds. By building a Vitess operator, HubSpot encoded MySQL cluster operations, such as provisioning, failover and replica management through Vitess, into Kubernetes automation, so databases and microservices could share one platform and one set of practices. The scale is the notable part: over a thousand MySQL clusters per environment is far beyond what manual administration could handle, and is precisely the long tail where standard automation matters most. It also fits the chapter's broader themes. Vitess replicates data at the database layer, which is what makes it compatible with application-managed durability, and PlanetScale later built Metal on Vitess with local NVMe. HubSpot's experience also answers the senior staff lens's key question: it had an operator it built and trusted, run in production for years.",
+    "quiz": {
+      "q": "What did HubSpot gain by running Vitess on Kubernetes with an operator?",
+      "a": "Its engineers said it unified data storage and microservices infrastructure on Kubernetes, letting automation manage over a thousand MySQL clusters per environment by 2023."
+    }
+  },
+  {
+    "id": "ch04-064",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "Stateful K8s risks: node drains and zonal volumes",
+    "body": "Two failure modes hit databases on Kubernetes hard. First, node drains and upgrades: a cluster upgrade drains nodes one by one, and for a database each drain is a failover. Use PodDisruptionBudgets so no more than one replica is down at a time, and make the operator wait for replication health before the next drain. Second, zonal volumes: an EBS volume cannot move to another AZ, so if a zone fails, pods whose PVCs live there cannot reschedule elsewhere.",
+    "deeper": "Drains are routine for stateless apps: pods get evicted and restart elsewhere in seconds with nothing lost. For a replicated database, evicting the primary triggers a failover, and evicting replicas reduces redundancy. If an upgrade drains nodes faster than replicas can resync, the cluster could end up with multiple members down or behind at once. A PodDisruptionBudget tells Kubernetes the minimum number of pods that must stay available, blocking voluntary evictions that would violate it, and the operator adds the database-aware check that a restarted replica has caught up before the next drain proceeds. Zonal volumes are a hard physical constraint. Because EBS replicates only inside one AZ and cannot move between zones, a zone outage strands every pod whose data lives there; Kubernetes can reschedule the pod, but not its volume. The only defense is application-level replication across zones, so replicas in surviving zones can take over. This echoes the earlier lesson that on AWS, cross-AZ durability is the application's job.",
+    "quiz": {
+      "q": "Why must database replicas on Kubernetes span zones at the application level when using EBS?",
+      "a": "EBS volumes cannot move across AZs, so a zone failure strands pods whose PVCs live there. Only replicas in other zones can take over."
+    }
+  },
+  {
+    "id": "ch04-065",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "Stateful K8s risks: stuck detaches and lost local disks",
+    "body": "Two more risks. Volume attach and detach delays: moving a network volume to a new node takes time, and a stuck detach, when the old node is unreachable, can block the new pod for minutes. Operators should fail over to a replica rather than wait for the volume. Local PV loss: with local disks, replacing a node means losing that replica's data. Automation must detect the loss and rebuild the replica from its peers, without waiting for a human.",
+    "deeper": "A stuck detach happens because the storage system must be sure the old node is no longer writing before attaching the volume elsewhere; if the old node is unreachable rather than cleanly dead, the system may wait before forcing the detach. For a database primary, those minutes are an outage. The operator's better move is to promote an existing replica, whose data is already attached and up to date, and deal with the old volume later. This mirrors the recovery comparison from the local-versus-network section: reattaching a network volume is usually fast, but not always, so replicas remain the fastest failover path. Local PV loss is the other side of local storage: a node replacement during an upgrade, or a hardware failure, silently removes a replica's data. If automation does not notice, the cluster runs with reduced redundancy indefinitely. The rebuild itself takes time proportional to data size divided by allowed bandwidth, the calculation that showed about 2.2 hours for 10 TB throttled to 1.25 GB/s.",
+    "quiz": {
+      "q": "If a database primary's old node is unreachable and its volume detach is stuck, what should the operator do?",
+      "a": "Fail over to an existing replica rather than wait minutes for the volume to detach and reattach to a new node."
+    }
+  },
+  {
+    "id": "ch04-066",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "Stateful K8s risks: deleted namespaces and noisy neighbor pods",
+    "body": "The last two risks. Accidental deletion: a single kubectl delete namespace can remove PVCs, and with a Delete reclaim policy the cloud volumes go too, destroying the data. Defend with the Retain policy, deletion protection and off-cluster backups. Noisy neighbors: pods on the same node share the node's network bandwidth to EBS and the instance's EBS limits, so one heavy pod can slow others. Put heavy databases on dedicated node pools to isolate them.",
+    "deeper": "Accidental deletion is dangerous because Kubernetes makes deletion cascade conveniently. Removing a namespace removes everything in it, including PVCs, and a Delete reclaim policy extends the cascade to the actual cloud disks. The layered defense matters: Retain stops the cascade at the volume, deletion protection guards the resources themselves, and off-cluster backups ensure recovery even if something inside the cluster or account is destroyed. Backups that live only in the same cluster can vanish in the same mistake. Noisy neighbors reappear at the node level even after EBS solved much of the problem at the storage layer. Each instance has limited bandwidth to EBS, and every pod on the node competes for it, so a batch job doing heavy I/O can inflate the database's latency. Dedicated node pools, groups of nodes reserved for database workloads, give heavy databases the instance's full EBS bandwidth and predictable performance. Both risks are examples of the general point that stateful workloads need different guardrails than stateless apps.",
+    "quiz": {
+      "q": "Why are off-cluster backups needed even with a Retain reclaim policy?",
+      "a": "Retain protects only against PVC deletion cascading to volumes. Backups outside the cluster survive broader mistakes or losses that could destroy in-cluster data."
+    }
+  },
+  {
+    "id": "ch04-067",
+    "chapter": 4,
+    "section": "4.7 Kubernetes storage",
+    "title": "Senior staff lens: can your operator fail over under real failure?",
+    "body": "The real question is not 'can Kubernetes run databases?' It can. The question is whether the team has an operator it trusts to fail over, rebuild and upgrade, and whether it has practiced those operations under real failure. Many companies choose managed databases or dedicated VMs for their largest stores, and use Kubernetes for the long tail of smaller databases, where standard automation matters more than squeezing out every bit of latency.",
+    "deeper": "This lens reframes a common debate into something testable. Kubernetes provides the building blocks, PVCs, StorageClasses, CSI, StatefulSets, but the safety of a database on it rests almost entirely on the operator's behavior during bad moments: a node drained mid-upgrade, a stuck volume detach, a lost local disk, a zone outage. An operator that has never been exercised under those conditions is an untested disaster-recovery plan. Practicing means deliberately injecting failures and verifying that failover, rebuild and upgrade behave as expected. The split strategy many companies adopt follows from economics. The largest, most performance-critical stores justify dedicated infrastructure or a managed service, where latency can be tuned carefully and specialists focus on a few systems. The long tail, hundreds or thousands of smaller databases, benefits most from Kubernetes' standardized automation, since manual care per database is impossible at that count. HubSpot's thousand-plus Vitess clusters per environment show the long tail approach at scale.",
+    "quiz": {
+      "q": "Why do many companies run only their long tail of databases on Kubernetes, not their largest stores?",
+      "a": "For many small databases, standard automation matters most. The largest stores need tuned latency and specialist care, often via managed databases or dedicated VMs."
+    }
+  },
+  {
+    "id": "ch04-068",
+    "chapter": 4,
+    "section": "4.8 Shared file storage, briefly",
+    "title": "EFS, Filestore, Azure Files: shared POSIX filesystems as a service",
+    "body": "Sometimes many machines need to share the same POSIX filesystem, for example shared home directories, content management, ML notebooks and legacy apps. Clouds offer managed network filesystems. Amazon EFS uses NFSv4.1, with elastic capacity and data stored across multiple AZs in its regional classes. Google Filestore is managed NFS for Compute Engine and GKE. Azure Files provides managed SMB and NFS shares. These are the usual backing for Kubernetes ReadWriteMany volumes.",
+    "deeper": "Block storage and object storage do not cover this need. A block volume normally attaches to one machine at a time, because a block device has no coordination between writers, and object storage lacks POSIX semantics such as in-place edits, directories and file locking that legacy software expects. Network filesystems fill the gap by letting many clients mount the same tree and see each other's changes through standard file APIs. EFS stands out for durability: its regional classes store data across multiple Availability Zones, unlike single-AZ EBS, and its capacity grows automatically without provisioning. Filestore integrates with Google's VMs and Kubernetes; Azure Files supports both SMB, common for Windows workloads, and NFS. In Kubernetes, a ReadWriteMany claim, one mountable read-write by many nodes, is typically satisfied by one of these services, which is why they appear in shared-content and notebook platforms. The trade-off, covered next, is performance on metadata-heavy operations, which limits where these filesystems belong.",
+    "quiz": {
+      "q": "Why do Kubernetes ReadWriteMany volumes usually rely on services like EFS rather than block volumes?",
+      "a": "Block volumes typically attach to one node with no cross-writer coordination; managed network filesystems provide shared POSIX access for many clients simultaneously."
+    }
+  },
+  {
+    "id": "ch04-069",
+    "chapter": 4,
+    "section": "4.8 Shared file storage, briefly",
+    "title": "Shared filesystems: great for sharing, bad for databases",
+    "body": "Managed network filesystems are convenient, but keeping POSIX semantics consistent across many clients makes metadata operations, such as open, stat and creating small files, much slower than on a local disk. That makes them a poor fit for databases and for workloads with millions of tiny files. The chapter's guidance is clear: large-scale analytics should use object storage instead, and databases should use block storage. Shared filesystems belong to genuinely shared-file use cases.",
+    "deeper": "The cost comes from coordination. On a local disk, opening or statting a file is a quick in-kernel operation. On a network filesystem, the server must keep every client's view consistent, so metadata operations often require network round trips and server-side coordination, adding latency to each one. A workload that touches millions of small files multiplies that latency millions of times. Databases suffer for related reasons: they need fast, predictable random I/O and reliable fsync semantics, and a shared filesystem adds network and protocol overhead with none of the benefits, since only one database instance should write its files anyway. Analytics over huge datasets benefits more from object storage, which scales throughput massively and avoids POSIX metadata costs. The resulting map summarizes much of the book so far: objects for immutable bulk data and analytics, block volumes, network or local, for databases, and shared filesystems only when multiple machines truly need the same POSIX tree, such as home directories, notebooks or legacy applications.",
+    "quiz": {
+      "q": "Why are shared network filesystems a poor fit for workloads with millions of tiny files?",
+      "a": "POSIX consistency across clients makes metadata operations like open, stat and small-file creates much slower than local disk, and that cost multiplies per file."
+    }
+  },
+  {
+    "id": "ch04-070",
+    "chapter": 4,
+    "section": "Key takeaways",
+    "title": "Kafka skips fsync, PostgreSQL panics on it: both are right",
+    "body": "Kafka's documentation says durability does not require fsync, while PostgreSQL treats an fsync failure as fatal. Both are correct because durability lives in different layers. Kafka relies on replication: a failed broker recovers its data from other replicas, so local fsync is not the source of durability. PostgreSQL relies on its local write-ahead log being on disk for committed transactions, and after an fsync error the kernel may have dropped dirty pages, so the only safe action is to crash and recover.",
+    "deeper": "This pairing ties together the chapter's central themes. First, where durability lives: Kafka puts it in the replication layer, PostgreSQL puts it in the local storage layer, and each design follows consistently from that choice. The senior staff advice to put durability in exactly one layer, on purpose, is visible here. Second, storage choice: because Kafka's durability does not depend on any one disk, it fits local NVMe well; a single-node PostgreSQL without replicas needs durable network volumes and snapshots, while a replicated setup might go local, as PlanetScale did with Vitess-managed MySQL. Third, the fsync mechanics: write() only reaches the page cache; fsync forces data to stable storage; commit rate is bounded by fsync latency; and on Linux a failed write-back can mark pages clean and drop data, so a retried fsync may falsely succeed. The key takeaways compress it into one line: databases live or die by fsync, and an fsync error means the page cache cannot be trusted.",
+    "quiz": {
+      "q": "Why does Kafka say durability doesn't require fsync, while PostgreSQL treats fsync failure as fatal?",
+      "a": "Kafka's durability comes from replicas on other brokers. PostgreSQL depends on its local WAL being on disk, and after an fsync error dropped pages make crash-and-replay the only safe path."
+    }
+  }
+]

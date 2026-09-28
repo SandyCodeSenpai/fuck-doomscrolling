@@ -1,0 +1,698 @@
+[
+  {
+    "id": "ch07-001",
+    "chapter": 7,
+    "section": "Chapter introduction",
+    "title": "Most of a company's bytes are old, cold, and undeletable",
+    "body": "At a big company, most stored bytes are not profiles or messages. They are old photos, old logs and huge analytics tables. The typical pattern: written once, read heavily for a short time, then almost never read again. Yet you cannot just delete them. Some data trains machine learning models, some is needed for audits, and some is a user's wedding photo from 2012. Managing this mass of cooling data cheaply, without losing it, is the problem this chapter tackles.",
+    "deeper": "The chapter splits the problem into three parts. First, the data lake: the storage that sits under analytics, where engines scan huge tables. Second, tiering: moving data to cheaper media as it cools, so the small hot fraction stays on fast hardware while the large cold fraction sits on dense, cheap hardware. Third, archival: keeping data for decades at the lowest possible cost, where retrieval in hours is acceptable.\n\nA fourth theme ties them together: retention, which decides how long data lives at all. Table formats such as Iceberg, Hudi and Delta come up repeatedly, but only briefly; the focus stays on the storage underneath them. The key mental shift is that storage economics is not about the average byte. It is about recognizing that most bytes are cold, that they get cold quickly, and that each temperature deserves different media, different redundancy and even different datacenter designs. The running example throughout is a global app with 1 billion users generating event logs, database snapshots and photos.",
+    "quiz": {
+      "q": "Why can't a company simply delete data once it stops being read often?",
+      "a": "Cold data still has value or obligations: it may train ML models, be required for audits or compliance, or be irreplaceable user content like old personal photos."
+    }
+  },
+  {
+    "id": "ch07-002",
+    "chapter": 7,
+    "section": "7.1 What a data lake really is",
+    "title": "A data lake: shared files in columnar formats, many engines",
+    "body": "A data lake is a large, shared store of raw and processed data files. The files are usually in open columnar formats such as Parquet or ORC, which store each column together so a query reads only the columns it needs. Many compute engines, including Spark, Presto/Trino, Hive and Flink, read and write the same files. Because the formats are open and shared, one copy of the data can serve many different tools and teams.",
+    "deeper": "Columnar layout is what makes lake scans affordable. If a table has 200 columns and a query needs three, a row-oriented file forces the engine to read all 200; a columnar file lets it fetch only the three column chunks. Columns also compress well because values of the same type and similar content sit next to each other, which is why encodings like run-length and dictionary work so effectively.\n\nThe shared, open nature matters as much as the layout. Because Spark, Trino, Hive and Flink all understand Parquet and ORC, a batch job can write a table that an interactive query engine reads minutes later, with no export step. That is different from a traditional warehouse, where data lives inside one vendor's engine. The trade-off is that someone must manage the files themselves: how big they are, which ones belong to a table, and when old ones are deleted. Much of this chapter is about those storage-level chores, such as small files, compaction and tiering, that the lake's openness pushes onto the platform team.",
+    "quiz": {
+      "q": "Why does storing data in a columnar format like Parquet make analytics queries cheaper?",
+      "a": "Each column is stored together, so a query reads only the columns it needs instead of whole rows, and similar values compress better."
+    }
+  },
+  {
+    "id": "ch07-003",
+    "chapter": 7,
+    "section": "7.1 What a data lake really is",
+    "title": "Separate storage from compute and let clusters come and go",
+    "body": "The key idea of a data lake is separation of storage and compute. All files sit in one big storage system, while compute clusters that process them come and go independently. You can add another query engine, or spin up a temporary cluster for a big job, without copying the data anywhere. Storage grows with how much data you keep; compute grows with how much work you run. Each can be sized and paid for on its own.",
+    "deeper": "Without separation, capacity planning gets awkward. If every storage server is also a compute server, a team that needs more disk but not more CPU still has to buy both, and vice versa. Separation removes that coupling: storage can be dense, disk-heavy machines or an object store, and compute can be ephemeral clusters that exist only while a job runs.\n\nThe cost is that every read crosses the network, because the data no longer sits on the machine doing the work. This became acceptable as datacenter networks grew fast and flat, and because columnar formats cut how many bytes each query must pull. Separation also lets many engines share the same data. A new engine does not need its own copy, which avoids drift between duplicated datasets and saves the storage bill. This idea explains the whole arc of the chapter: first-generation HDFS lakes tied storage and compute together, and the move to object stores and systems like Tectonic was largely about breaking that tie.",
+    "quiz": {
+      "q": "What does separating storage from compute let a team do that a combined design makes hard?",
+      "a": "Scale disk and CPU independently, run ephemeral compute clusters, and add new query engines without copying data, paying only for what each side needs."
+    }
+  },
+  {
+    "id": "ch07-004",
+    "chapter": 7,
+    "section": "7.1 What a data lake really is",
+    "title": "Lakes are built for throughput and cost per byte, not latency",
+    "body": "In the running example of a global app with 1 billion users, the lake holds three kinds of data. Event logs record every click, view and message-send, append-only, at many petabytes per year. Daily snapshots of the profile and message databases are copied in for analysis. Derived tables hold results like daily active users, ad reports and ML training sets. Nobody needs a single event in 5 ms, but analysts scan billions of rows per second.",
+    "deeper": "This workload shapes every design choice. Because the unit of work is a scan over billions of rows rather than a lookup of one record, the lake is optimized for throughput, measured in bytes per second, and for cost per byte. Latency for a single item hardly matters.\n\nThat is the opposite of a serving database, where a user waits on each request and milliseconds count. It frees the lake to use dense hard drives, aggressive erasure coding, network reads instead of local reads, and large files that are efficient to stream. It also explains why small files hurt so much: a lake tuned for streaming big sequential reads suffers when forced to issue millions of tiny requests. The three data types also age differently. Event logs grow endlessly and cool quickly. Snapshots are replaced daily. Derived tables may be rebuilt or read repeatedly. Those differences later drive different tiering and retention rules for each type, such as deleting raw click events after a couple of years.",
+    "quiz": {
+      "q": "Why is a data lake optimized for throughput rather than latency?",
+      "a": "Its work is scanning billions of rows for analytics, so bytes per second and cost per byte matter; nobody waits on a single event in milliseconds."
+    }
+  },
+  {
+    "id": "ch07-005",
+    "chapter": 7,
+    "section": "7.1.1 Three layers of a lake",
+    "title": "Five stacked layers: from engines down to tape",
+    "body": "A lake is easiest to reason about as a stack. At the top are compute engines such as Spark, Trino, Flink and BigQuery. Below them sits the table format and catalog: Hive, Iceberg, Hudi or Delta. Next is the file format: Parquet, ORC or Google's Capacitor. Then the storage layer: HDFS, S3, GCS, Tectonic or Colossus. At the bottom is the physical media: HDD, flash or tape. Keeping these layers separate in your head avoids confusing their jobs.",
+    "deeper": "The chapter describes three core lake layers, the storage layer, the file format and the table format, with engines above and media below. Each has a distinct responsibility. The storage layer stores bytes and names, meaning paths or object keys; it does not know what a table is. The file format decides how rows and columns are laid out inside each file, for example grouping values by column. The table format tracks which files make up a table at each point in time, which gives transactions and snapshots.\n\nThe separation matters when things change. Uber swapped its storage layer from HDFS to Google Cloud Storage while keeping the layers above untouched. Netflix created Iceberg, a table-format layer, because the storage layer below it, S3, could not provide atomic renames that Hive depended on. Colossus does tiering at the media level, invisible to everything above. When diagnosing a lake problem, asking which layer owns it quickly narrows the fix: small files are a storage and table-maintenance issue, while slow commits on S3 are a table-format issue.",
+    "quiz": {
+      "q": "Which lake layer is responsible for knowing which files make up a table at a given time?",
+      "a": "The table format (Iceberg, Hudi, Delta). The storage layer only knows bytes and names; the file format only lays out data inside each file."
+    }
+  },
+  {
+    "id": "ch07-006",
+    "chapter": 7,
+    "section": "7.2 Generation 1: HDFS lakes",
+    "title": "HDFS: one NameNode holds the tree, DataNodes hold 3 copies",
+    "body": "From about 2008 to 2020, most big data lakes ran on HDFS, the Hadoop Distributed File System. HDFS keeps all file metadata in a single NameNode, a server that holds the entire directory tree in memory. The actual data blocks live on many DataNodes. By default, each block is copied 3 times across DataNodes for durability. This simple design powered the first generation of large lakes before its scaling limits became painful.",
+    "deeper": "HDFS had real strengths. The first was data locality: the scheduler could run a task on the very machine holding the block it needed, so reads skipped the network entirely. In an era of slower, oversubscribed datacenter networks this was a big deal. The second was cost: it was open source and ran on cheap commodity disks.\n\nBut the architecture baked in three problems that grew with scale. The single NameNode keeps every file and block in RAM, so metadata size is bounded by one machine's memory. Triple replication means every petabyte of data needs three petabytes of disk. And because DataNodes double as compute nodes, storage and compute are tied together. Each of these problems pushed companies toward the second generation of lakes on object storage, or toward custom systems like Meta's Tectonic. Understanding the HDFS design is therefore the baseline for understanding why modern lakes look the way they do.",
+    "quiz": {
+      "q": "What was data locality in HDFS, and why was it valuable?",
+      "a": "Running a task on the machine that holds the block it reads, so the read skips the network, which mattered when networks were slower."
+    }
+  },
+  {
+    "id": "ch07-007",
+    "chapter": 7,
+    "section": "7.2 Generation 1: HDFS lakes",
+    "title": "The NameNode RAM ceiling: every file costs memory",
+    "body": "HDFS's first scaling problem is the NameNode. Every file and every block is tracked in the NameNode's RAM. More files means more memory, which in turn means longer garbage-collection pauses and more lock contention on that single server. Because one machine holds the whole namespace, the total number of files a cluster can hold is capped by that machine. As lakes grew into billions of files, this became a hard limit.",
+    "deeper": "Uber offers a public example. In 2018 Uber wrote that its HDFS data grew more than 400% in 2017. By late 2016, NameNode queue time had passed 500 ms, against a normal level of under 10 ms, so every metadata operation across the cluster was slowed.\n\nUber's fixes show the typical toolbox. ViewFs placed several physical namespaces behind one virtual view, effectively splitting the metadata load across multiple NameNodes while users saw one tree. They also did upgrades, tuned garbage collection, and built small-file merge tools, because reducing the file count directly relieves NameNode memory.\n\nThe lesson is that the NameNode problem is really a file-count problem, not a byte-count problem. A cluster can hold petabytes comfortably in large files and still fall over under millions of tiny ones. This is why the small-files problem is so tightly linked to HDFS, and why moving to object stores, which have no single metadata server, was attractive.",
+    "quiz": {
+      "q": "Why does file count rather than total bytes drive NameNode trouble?",
+      "a": "Every file and block occupies NameNode RAM, so millions of small files exhaust memory and cause GC pauses and lock contention even when total bytes are modest."
+    }
+  },
+  {
+    "id": "ch07-008",
+    "chapter": 7,
+    "section": "7.2 Generation 1: HDFS lakes",
+    "title": "3x replication vs RS(6,3): 200% overhead down to 50%",
+    "body": "HDFS's second problem is cost. By default every block is stored three times, so every petabyte of data needs three petabytes of disk, a 200% overhead. HDFS 3 added erasure coding, with RS(6,3) as the default policy: data is split into 6 chunks plus 3 parity chunks, cutting overhead to about 50%. But erasure-coded files lose some features, such as append, and most reads go across racks.",
+    "deeper": "Reed-Solomon RS(6,3) stores 6 data chunks and 3 parity chunks, so 9 chunks hold 6 chunks' worth of data. Any 6 of the 9 are enough to rebuild the original, so it survives the loss of 3 chunks while using 1.5x raw capacity instead of 3x. At lake scale, going from 3 PB to 1.5 PB per petabyte stored is an enormous saving.\n\nThe trade-offs are why replication did not disappear. Erasure-coded files in HDFS cannot be appended to, which clashes with workloads that grow files over time. Reads usually cross racks because the chunks are spread out, so data locality is weakened. Rebuilding a lost chunk also requires reading several others. The pattern repeats across systems in this chapter: Meta's Tectonic uses RS(9,6) for long-lived warehouse data and RS(3,3) for short-lived shuffle output, and Meta moved warm photos from 3.6x to 2.1x effective replication. More aggressive coding fits colder, more stable data.",
+    "quiz": {
+      "q": "What does HDFS give up when it switches a file from 3x replication to RS(6,3) erasure coding?",
+      "a": "Features like append, plus locality: most reads go across racks. In exchange overhead drops from 200% to about 50%."
+    }
+  },
+  {
+    "id": "ch07-009",
+    "chapter": 7,
+    "section": "7.2 Generation 1: HDFS lakes",
+    "title": "When DataNodes are compute nodes, disk forces CPU purchases",
+    "body": "HDFS's third problem is that storage and compute are tied together. A DataNode is also a compute node, because data locality depends on running tasks where the blocks live. So if a team needs more disk but not more CPU, it still has to buy whole servers with both. Over time, data volume and compute demand grow at different rates, and the coupled design wastes money on whichever resource is not the bottleneck.",
+    "deeper": "This coupling was a deliberate choice, not an accident. Data locality, HDFS's big advantage, only works if the machine storing a block can also run the task that reads it. The price is that the cluster's shape is fixed: disk and CPU come in the ratio of the server model you buy.\n\nLake data tends to grow relentlessly, because event logs are append-only and retention periods are long, while compute needs fluctuate with analysts' and jobs' demand. A coupled cluster must be sized for the larger of the two, leaving the other idle. Separating them lets storage be built from dense disk-heavy machines or rented from an object store, while compute runs on clusters sized to the current workload and shut down when idle.\n\nThis is the third of the reasons companies moved lakes from HDFS to object storage around 2015 to 2020, alongside the NameNode limit and the cost of triple replication. Meta's Tectonic addressed a related problem inside its own fleet.",
+    "quiz": {
+      "q": "Why did HDFS tie storage and compute together in the first place?",
+      "a": "Data locality required tasks to run on the machine holding the block, so DataNodes doubled as compute nodes, fixing the disk-to-CPU ratio."
+    }
+  },
+  {
+    "id": "ch07-010",
+    "chapter": 7,
+    "section": "7.2 Generation 1: HDFS lakes",
+    "title": "Uber 2016-2018: HDFS grew 400% and the NameNode choked",
+    "body": "Uber wrote in 2018 that its HDFS data grew more than 400% in 2017. In late 2016, NameNode queue time passed 500 ms, compared with a normal level of under 10 ms, meaning every metadata operation across the cluster was dramatically slowed. Uber's fixes included ViewFs (several physical namespaces behind one virtual view), software upgrades, garbage-collection tuning and tools to merge small files. It is a textbook case of first-generation lake scaling pain.",
+    "deeper": "Each fix targets a different part of the NameNode problem. ViewFs attacks the single-namespace limit: instead of one NameNode holding everything, several physical namespaces each hold a part, while users and jobs see one virtual tree. Upgrades bring performance fixes in newer HDFS releases. Garbage-collection tuning reduces the pauses that a huge in-memory heap causes on the Java-based NameNode. Small-file merge tools reduce the number of objects the NameNode must track at all, often the most direct lever.\n\nA jump from under 10 ms to over 500 ms is a 50-fold slowdown in metadata operations, which affects every job listing directories, opening files or creating output. Uber's growth was driven by business expansion and data-hungry analytics, which is typical. This experience fed later decisions. Uber built Hudi on HDFS to handle mutable data, and in 2024 announced a move of its batch analytics and ML storage from on-premises Hadoop to Google Cloud Storage.",
+    "quiz": {
+      "q": "How does merging small files help an overloaded HDFS NameNode?",
+      "a": "The NameNode keeps every file and block in RAM; fewer, larger files mean less memory, shorter GC pauses and less lock contention."
+    }
+  },
+  {
+    "id": "ch07-011",
+    "chapter": 7,
+    "section": "7.2.1 The small-files problem",
+    "title": "The small-files problem: lakes want 1 GB, streams make 7 MB",
+    "body": "The small-files problem is the most common pain in any data lake. Lakes work best with files of 128 MB to 1 GB. But streaming jobs flush a file every few minutes per partition, and every parallel task writes its own output file. The result is millions of files of only a few KB or MB each. The data volume is fine; the sheer number of files is what overwhelms metadata systems, request budgets and query planners.",
+    "deeper": "Small files are a natural side effect of how data arrives, not a mistake. Freshness pushes streaming jobs to flush often, and parallelism means each task writes separately, so a job with hundreds of partitions and frequent flushes multiplies file counts quickly.\n\nThe problem is described as permanent in the chapter's takeaways: you cannot design it away, only manage it continuously. That is why the standard answer, compaction, is treated as an ongoing platform service rather than a one-time cleanup.\n\nIt also hurts across generations. On HDFS the cost lands on NameNode memory. On object stores, which have no single metadata server, the cost shifts to per-request latency and fees, because every file needs its own LIST entry and GET. Both designs also suffer at the file-format level, since tiny Parquet files have tiny column chunks. Moving from HDFS to S3 therefore changes who pays for small files but does not make the problem go away.",
+    "quiz": {
+      "q": "Why does the small-files problem hurt both HDFS and object-store lakes despite their different metadata designs?",
+      "a": "HDFS pays per file in NameNode RAM; object stores pay per file in LIST/GET requests, latency and fees. Both lose compression and planning speed."
+    }
+  },
+  {
+    "id": "ch07-012",
+    "chapter": 7,
+    "section": "7.2.1 The small-files problem",
+    "title": "Three ways tiny files hurt: metadata, requests, compression",
+    "body": "Small files hurt in three ways. Metadata cost: on HDFS each file consumes NameNode memory, and on object stores each file needs its own LIST entry and GET. Request cost and latency: 1 GB stored as 10,000 files of 100 KB takes 10,000 requests, each with fixed latency of often tens of ms and, on S3, a price. Worse compression and planning: tiny files have tiny column chunks, so Parquet compresses poorly, and planners must open every file's footer.",
+    "deeper": "The request math is the easiest to feel. Reading 1 GB as one file is essentially one long sequential stream. Reading it as 10,000 files of 100 KB means 10,000 separate round trips, each paying fixed setup latency, often tens of milliseconds, before any bytes move. Even with parallelism, that overhead dominates, and on S3 every GET is billed.\n\nThe compression effect is subtler. Columnar formats get their efficiency from long runs of similar values within a column chunk. A file holding only a few thousand rows produces short chunks, so encodings like dictionary and run-length have less to work with, and per-file headers and footers become a larger share of total bytes.\n\nPlanning cost adds up too. Before running a query, an engine reads each Parquet file's footer to learn its schema and column statistics. With millions of files, planning alone can take longer than the scan. Each of these costs scales with file count, which is why fixing file count via compaction improves all three at once.",
+    "quiz": {
+      "q": "Why do tiny Parquet files compress worse than large ones?",
+      "a": "Each file has only short column chunks, so encodings like run-length and dictionary find fewer repeats, and fixed per-file overhead is a larger fraction."
+    }
+  },
+  {
+    "id": "ch07-013",
+    "chapter": 7,
+    "section": "7.2.1 The small-files problem",
+    "title": "Back-of-envelope: 52 million files a year from one table",
+    "body": "Take a table receiving 1 TB per day from a streaming job with 500 partitions that flushes every 5 minutes. That is 500 x 288 = 144,000 files per day, averaging about 7 MB each. After one year the table holds about 52 million files. If the same data were stored as 512 MB files, it would be about 2,000 files per day, or 730,000 per year: 70 times fewer objects to list, open and track.",
+    "deeper": "The arithmetic is worth internalizing because it shows how innocent settings multiply. A 5-minute flush interval gives 288 flushes per day (1,440 minutes divided by 5). Multiply by 500 partitions and you get 144,000 files daily. Divide 1 TB by 144,000 and each file is only about 7 MB, well below the 128 MB to 1 GB sweet spot.\n\nOver 365 days, 144,000 files per day becomes roughly 52 million files for one table. On HDFS every one of those sits in NameNode memory; on an object store every query planning pass may need to list and open a large share of them.\n\nThe same terabyte per day in 512 MB files is about 2,000 files, or 730,000 a year. Nothing about the data changed, only the file layout. This is why the usual design keeps small, frequent files for freshness during the current hour or day, then compacts each partition into large files once it closes. Reducing partitions or flush frequency is the other lever, at the cost of freshness.",
+    "quiz": {
+      "q": "In the example, which two settings multiply to produce 144,000 files per day, and what are the levers to reduce it?",
+      "a": "500 partitions times 288 five-minute flushes. Reduce partitions or flush frequency (hurting freshness), or compact closed partitions into large files."
+    }
+  },
+  {
+    "id": "ch07-014",
+    "chapter": 7,
+    "section": "7.2.1 The small-files problem",
+    "title": "Compaction: rewrite many small files as few big ones",
+    "body": "Compaction is the fix for small files. It is a background job that reads many small files and rewrites them as fewer, larger files. It then updates the table metadata so readers switch to the new files atomically, meaning a query sees either all old files or all new ones, never a mix. The old files are deleted later, after readers that might still use them have finished. File count drops, and queries get faster.",
+    "deeper": "The atomic switch is what makes compaction safe on a live table. Readers that started before the switch keep seeing the old files, while new readers see the compacted ones. This is exactly the kind of guarantee table formats such as Iceberg and Hudi provide, by recording which files make up the table at each snapshot. Deleting old files later, rather than immediately, avoids breaking queries still in flight.\n\nCompaction is not free. It reads and writes the data again, which is write amplification: compact the same data three times and you have written it four times. It competes with production jobs for cluster capacity. It can also conflict with writers on the same partition, forcing retries.\n\nThe usual design balances these: write small files quickly for freshness, then compact a partition once it is closed, for example once the hour has passed. Closed partitions no longer receive writes, so conflicts disappear, and the data is compacted once rather than repeatedly.",
+    "quiz": {
+      "q": "Why do lakes usually compact a partition only after it is closed, such as once the hour has passed?",
+      "a": "No more writers touch it, so compaction avoids conflicts and retries, and data is rewritten once instead of repeatedly, limiting write amplification."
+    }
+  },
+  {
+    "id": "ch07-015",
+    "chapter": 7,
+    "section": "7.2.1 The small-files problem",
+    "title": "LinkedIn OpenHouse: table maintenance as a platform service",
+    "body": "LinkedIn built OpenHouse, a control plane for lakehouse tables, in production since late 2022. It stores Iceberg tables on HDFS and runs table maintenance as scheduled Spark jobs: snapshot expiration, orphan file deletion, manifest compaction, retention (data purging and partition expiration), and cross-datacenter snapshot replication. The lesson: at scale, compaction and cleanup are not something each team should remember to do. They must be a platform service that runs automatically for every table.",
+    "deeper": "Each maintenance task addresses a specific way lake tables decay. Snapshot expiration removes old table versions that table formats keep for time travel, which would otherwise pin old files forever. Orphan file deletion removes files written by failed jobs that no snapshot references. Manifest compaction shrinks the metadata files Iceberg uses to track data files, so planning stays fast. Retention purges data and expires partitions past their allowed age. Cross-datacenter snapshot replication keeps copies in other sites.\n\nIf each team must schedule these itself, some teams forget, some do it wrong, and costs creep up invisibly. By centralizing maintenance in a control plane, LinkedIn makes every table get the same hygiene by default.\n\nOpenHouse reappears later in the chapter for retention: because data copies spread through derived tables and training sets, building retention into the table platform itself helps ensure deletion policies are actually enforced. LinkedIn's approach keeps its large owned HDFS fleet while adding central table governance on top.",
+    "quiz": {
+      "q": "Why is it risky to leave compaction and cleanup to each individual team?",
+      "a": "Teams forget or do it inconsistently, so small files, old snapshots, orphans and over-retained data pile up; a central platform applies maintenance uniformly."
+    }
+  },
+  {
+    "id": "ch07-016",
+    "chapter": 7,
+    "section": "7.3 Generation 2: object-store lakes",
+    "title": "Why lakes moved from HDFS to S3, GCS and Azure Blob",
+    "body": "Around 2015 to 2020, many companies moved their lakes from HDFS to object storage such as S3, Google Cloud Storage, Azure Blob or an internal equivalent. The reasons mirror HDFS's problems. Object stores have no single NameNode, so the file-count limit goes away, though per-request cost remains. The provider runs erasure coding and replication, so there is no 3x HDFS copy to manage. And storage and compute scale independently, so compute clusters can be ephemeral.",
+    "deeper": "Each benefit maps to one HDFS pain. The NameNode memory ceiling disappears because object-store metadata is distributed and managed by the provider. The expense of triple replication is handled inside the provider, which applies its own erasure coding and replication and bills per GB-month. The coupling of disk and CPU ends because storage is a separate service; compute can be rented for a job and released afterward.\n\nThe cost model changes too: instead of buying servers, you pay per GB-month plus per request. That makes request counts, and therefore file counts, a direct line item on the bill, which is why small files stay painful.\n\nThe move was not free. Every read now crosses the network, there is no data locality, and object stores lack atomic directory renames. Those gaps are why table formats like Iceberg and Hudi became essential in the second generation. Netflix, Uber and others each show a different path through this transition, and Meta shows an alternative: building its own exabyte-scale system instead.",
+    "quiz": {
+      "q": "Moving to an object store removes the NameNode limit. Which small-file cost remains?",
+      "a": "Per-request cost: every file still needs its own LIST entry and GET, each with latency and, on clouds like S3, a fee."
+    }
+  },
+  {
+    "id": "ch07-017",
+    "chapter": 7,
+    "section": "7.3 Generation 2: object-store lakes",
+    "title": "No data locality: every read crosses the network, and it's fine",
+    "body": "Object-store lakes give up data locality: compute no longer runs on the machine holding the data, so every read goes over the network. This works for two reasons. Datacenter networks became fast and flat, so reaching any storage server is cheap. And columnar formats such as Parquet read only the columns a query needs, reducing bytes on the wire. Together these made remote reads acceptable for analytics, enabling the separation of storage and compute.",
+    "deeper": "Data locality was HDFS's headline advantage in its era, when networks were slower and oversubscribed, so pulling data across racks was a real bottleneck. As networks improved, the gap between reading a local disk and reading over the network narrowed enough that flexibility became worth more than locality.\n\nColumnar formats amplify the effect. If a query touches 5 of 100 columns, it pulls only those column chunks, so the network carries a small fraction of the table. Combined with high aggregate bandwidth from many storage servers, this keeps scans fast.\n\nThe trade-off shows up in the comparison table: HDFS lakes offer data locality, while object-store lakes read everything over the network. In exchange, object-store lakes make scaling compute separately easy rather than hard. Note that erasure-coded HDFS already gave up much of its locality, since most reads of RS(6,3) data cross racks. The industry trend is clear: locality mattered less once networks and file formats caught up.",
+    "quiz": {
+      "q": "What two developments made giving up data locality acceptable for object-store lakes?",
+      "a": "Fast, flat datacenter networks made remote reads cheap, and columnar formats read only needed columns, cutting bytes sent over the network."
+    }
+  },
+  {
+    "id": "ch07-018",
+    "chapter": 7,
+    "section": "7.3 Generation 2: object-store lakes",
+    "title": "Object stores can't rename a directory atomically",
+    "body": "Object stores have different semantics from a file system. There are no real directories, only keys that look like paths, so renaming a directory is not atomic: it means copying and deleting many objects one by one. Old Hive-style tables committed a job by renaming a temporary directory into place, which is slow and unsafe on an object store. Table formats like Iceberg solve this by tracking files in metadata instead of relying on directory listings.",
+    "deeper": "On HDFS, renaming a directory is a single metadata operation on the NameNode, so it happens all at once. That made it a convenient commit mechanism: a job writes its output to a temporary directory, then renames it to the final location, and readers see either nothing or the complete result.\n\nOn an object store, a directory is just a shared key prefix. Renaming it means copying every object to a new key and deleting the old, which takes time proportional to the number of files and can fail halfway. Readers might see partial output, and listing a prefix to find a table's files is itself slow when there are many.\n\nIceberg's answer is to stop treating the directory as the source of truth. A table's metadata explicitly lists its data files for each snapshot, and a commit atomically swaps a pointer to a new metadata version. The comparison table summarizes: HDFS has atomic rename, object-store lakes do not and need a table format. This gap is one main reason Iceberg was created.",
+    "quiz": {
+      "q": "Why was the Hive commit-by-rename pattern unsafe on an object store?",
+      "a": "Directories are just key prefixes, so renaming means copying and deleting objects one by one: slow, non-atomic, and readers can see partial results."
+    }
+  },
+  {
+    "id": "ch07-019",
+    "chapter": 7,
+    "section": "7.3 Generation 2: object-store lakes",
+    "title": "HDFS lake vs object-store lake at a glance",
+    "body": "Comparing the two generations side by side: HDFS keeps metadata in one NameNode (or a federation) in RAM, while object stores distribute metadata managed by the provider. HDFS uses 3x replicas or RS(6,3); object stores use provider-managed erasure coding and replication. HDFS offers data locality and atomic rename; object stores offer neither, needing a table format for commits. Scaling compute separately is hard on HDFS, easy on object stores. HDFS means buying servers; object stores charge per GB-month plus requests.",
+    "deeper": "Reading the table as a set of trades clarifies when each generation fits. HDFS wins on locality and file-system semantics like atomic rename, but concentrates risk and limits in the NameNode, and couples storage to compute. Object stores win on elastic scale and operational simplicity, with the provider handling redundancy, but give up locality and need extra machinery, a table format, to provide safe commits.\n\nThe cost model row is easy to overlook but important. Buying servers is a capital expense sized in advance; paying per GB-month plus requests is an operating expense that tracks usage. With per-request billing, file counts and access patterns appear directly on the monthly bill, which makes the small-files problem and tiering decisions financial concerns, not just performance ones.\n\nMany companies ended up somewhere in between. LinkedIn stays on HDFS but adds Iceberg through OpenHouse. Uber is moving to Google Cloud Storage while keeping the HDFS API. Meta built its own system, Tectonic, rather than choosing either.",
+    "quiz": {
+      "q": "How does the cost model of an object-store lake change the importance of file counts compared with HDFS?",
+      "a": "Object stores bill per request as well as per GB-month, so every extra file adds LIST and GET charges directly to the bill."
+    }
+  },
+  {
+    "id": "ch07-020",
+    "chapter": 7,
+    "section": "7.3.1 Netflix: the S3 lake and the birth of Iceberg",
+    "title": "Netflix built Iceberg because Hive on S3 was slow and unsafe",
+    "body": "Netflix runs its data warehouse on Amazon S3, with compute clusters kept separate. Its engineers created Iceberg, later donated to Apache, because Hive tables on S3 had two problems. They were slow to plan, since finding a table's files meant listing directories. And they were unsafe to change, since there was no atomic commit. The storage lesson: on an object store, the table format must take over the file system's old job of knowing which files belong to a table.",
+    "deeper": "Netflix is the cloud-first example in the chapter's comparison: Amazon S3 for storage, Iceberg (created at Netflix) with Parquet for the table and file layers, chosen because the company runs in the cloud with separate compute.\n\nThe two Hive problems map directly to object-store semantics. Slow planning came from directory listings: to find a partition's files, Hive listed a prefix, and listing is slow and paginated on S3 when there are many objects. Unsafe changes came from the lack of atomic rename, so a commit could leave readers seeing partial output.\n\nIceberg fixes both by keeping an explicit, versioned list of data files in table metadata. Planning reads that metadata rather than listing directories, and a commit swaps to a new metadata version atomically. The broader principle outlives the specific tool: when you move from a file system to an object store, some responsibilities the file system quietly handled, such as consistent membership and atomic changes, must move up into a higher layer.",
+    "quiz": {
+      "q": "What job did the file system used to do that Iceberg takes over on an object store?",
+      "a": "Knowing which files belong to a table, with atomic changes, tracked in versioned metadata instead of directory listings and renames."
+    }
+  },
+  {
+    "id": "ch07-021",
+    "chapter": 7,
+    "section": "7.3.2 Uber: from HDFS with Hudi to Google Cloud Storage",
+    "title": "Uber's Hudi: updating immutable HDFS files within minutes",
+    "body": "Uber built Hudi (Hadoop Upserts Deletes and Incrementals) and described it publicly in March 2017. The problem: HDFS files are immutable, but Uber's trip data changes, for example a trip gets a rating or a fare is corrected. Rewriting whole partitions for each change was too slow. Hudi keeps metadata about commit times and file versions, so it can apply updates to HDFS data within minutes and let downstream jobs pull only changes since a given time.",
+    "deeper": "Hudi addresses a mismatch between storage and data. A lake file system is built for append-only, write-once data, but business records like trips are mutable. Without Hudi, correcting a single fare might mean rewriting an entire day's partition, which is expensive and delays freshness.\n\nBy tracking commit times and file versions in metadata, Hudi can write new versions of only the affected files and record which version is current. That gives upserts (update or insert) and deletes on top of immutable storage.\n\nThe incremental part is equally valuable. Because every change is tagged with a commit time, downstream jobs can ask for only records that changed since their last run instead of rescanning whole tables. That cuts compute and speeds pipelines. Uber later donated Hudi to Apache. In the chapter's comparison, Uber's choice of Hudi with Parquet is explained by mutable trip data. Like Iceberg at Netflix, Hudi is an example of a table format created to fix a gap in the storage layer beneath it.",
+    "quiz": {
+      "q": "What problem with HDFS did Hudi solve for Uber's trip data?",
+      "a": "HDFS files are immutable but trip data changes; Hudi tracks commits and file versions to apply updates within minutes without rewriting whole partitions."
+    }
+  },
+  {
+    "id": "ch07-022",
+    "chapter": 7,
+    "section": "7.3.2 Uber: from HDFS with Hudi to Google Cloud Storage",
+    "title": "Uber 2024: moving an exabyte Hadoop lake to Google Cloud",
+    "body": "On May 30, 2024, Uber published its plan to move batch analytics and ML training from on-premises Hadoop to Google Cloud Platform. Uber described its installation as one of the largest Hadoop deployments in the world: more than 1 exabyte of data across tens of thousands of servers in each of its two regions. The first phase uses Google Cloud Storage as the lake's storage and moves the rest of the stack to cloud VMs.",
+    "deeper": "The mechanism that makes the first phase possible is a cloud storage connector that implements the Hadoop FileSystem interface. Existing jobs call the same HDFS API as before, and the connector translates those calls to Google Cloud Storage. Jobs therefore run without code changes, even though the bytes now live in a completely different system.\n\nThe rest of the stack moves to cloud virtual machines as infrastructure as a service (IaaS), which again keeps the software largely the same. Only in later phases would Uber adopt managed services such as Dataproc and BigQuery, which would require more changes to how jobs run.\n\nIn the chapter's comparison, Uber's motivation is described as leaving behind mutable-data problems first (via Hudi), then exiting data-center capital expense. Uber's history spans both lake generations: an HDFS lake that hit NameNode limits in 2016 to 2018, Hudi in 2017 to manage mutable data, and in 2024 a shift to an object store. It is a rare public account of migrating exabyte-scale storage.",
+    "quiz": {
+      "q": "How did Uber make existing Hadoop jobs run unchanged on Google Cloud Storage?",
+      "a": "A cloud storage connector implements the Hadoop FileSystem interface, so jobs keep calling the HDFS API while bytes are stored in GCS."
+    }
+  },
+  {
+    "id": "ch07-023",
+    "chapter": 7,
+    "section": "7.3.2 Uber: from HDFS with Hudi to Google Cloud Storage",
+    "title": "Senior lens: keep the narrowest interface stable, move the bytes",
+    "body": "Notice the order Uber chose for its cloud migration. It swapped the storage layer first, behind the same HDFS API, and left the jobs alone. This is the classic low-risk migration pattern: keep the interface, change the implementation, then modernize the layers above later. When you plan a lake migration, ask one question: what is the narrowest interface I can keep stable while I move the bytes? That interface becomes your safety boundary.",
+    "deeper": "The value of this order is diagnostic as much as practical. If you change storage and rewrite jobs at the same time and something breaks, you cannot tell which change caused it. Changing one layer at a time means any failure points to the storage layer, not to a rewritten job, and jobs do not all need to be touched or retested at once.\n\nThe narrow interface here is the Hadoop FileSystem API. Everything above it, thousands of jobs, stays the same; everything below it, the bytes, moves. Choosing the narrowest stable interface minimizes the surface area that must behave identically in old and new worlds.\n\nThe same idea shows up elsewhere in the chapter. Meta's Tectonic replaced HDFS for the warehouse, and the layered view of a lake, with separate storage, file format and table format layers, is exactly what makes such swaps possible. Modernizing the upper layers, such as adopting BigQuery or Dataproc, becomes a later, separate project once the bytes are safely in place.",
+    "quiz": {
+      "q": "Uber moved storage to GCS first and kept Hadoop jobs unchanged. What risk does this order reduce?",
+      "a": "It changes one layer at a time, so failures point to storage, not rewritten jobs, and jobs needn't all be touched or retested at once."
+    }
+  },
+  {
+    "id": "ch07-024",
+    "chapter": 7,
+    "section": "7.3.3 Meta: the warehouse on Tectonic",
+    "title": "Meta's HDFS era: tens of clusters and a bin-packing puzzle",
+    "body": "Meta did not move to a public cloud. Instead it built its own exabyte-scale file system, Tectonic, described at FAST 2021. Before Tectonic, Meta's data warehouse ran on HDFS. HDFS clusters had size limits, so Meta needed tens of HDFS clusters per datacenter and had to split datasets across them. The Tectonic paper calls this a two-dimensional bin-packing problem: fitting both storage capacity and read throughput into each cluster at once.",
+    "deeper": "Bin packing means placing items into containers without exceeding their limits. Here it is two-dimensional because each dataset needs both space and IO throughput. A dataset might fit a cluster's free capacity but overload its disks' throughput, or vice versa. Operators had to juggle datasets across many clusters to balance both, and any cluster's leftover capacity in one dimension was often stranded because nothing fit the other.\n\nThis is the NameNode ceiling showing up operationally. Because each HDFS cluster is limited in size, a large warehouse must be split across many clusters, and splitting creates the packing problem, plus the overhead of running many independent systems.\n\nMeta's choice to build rather than buy fits its scale and ownership of its fleet. Its answer was a single file system large enough to host the warehouse as one tenant among others, removing the need to split datasets. In the chapter's comparison, Meta's reasons are exabyte scale and consolidating clusters, with ORC-based warehouse formats as its file layer.",
+    "quiz": {
+      "q": "Why did Meta's HDFS warehouse face a two-dimensional bin-packing problem?",
+      "a": "HDFS cluster size limits forced datasets across tens of clusters, and each placement had to fit both capacity and throughput limits simultaneously."
+    }
+  },
+  {
+    "id": "ch07-025",
+    "chapter": 7,
+    "section": "7.3.3 Meta: the warehouse on Tectonic",
+    "title": "Tectonic: 10x fewer warehouse clusters, 10.7 billion files",
+    "body": "Tectonic replaced three Meta systems: HDFS, Haystack and f4. Moving the warehouse to Tectonic cut the number of warehouse clusters by 10 times. One multitenant production cluster described in the paper had 1,590 PB of capacity, 1,250 PB used, 10.7 billion files and 4,208 storage nodes. Long-lived warehouse data is typically encoded with RS(9,6), while short-lived data like map-reduce shuffle output uses RS(3,3), matching redundancy to how long data lives.",
+    "deeper": "The numbers show what escaping the NameNode ceiling buys. 10.7 billion files in one cluster would be unthinkable for a single in-memory HDFS NameNode, and consolidating means fewer systems to run and no more splitting datasets across clusters.\n\nThe encoding choices illustrate matching redundancy to data lifetime. RS(9,6) means 9 data chunks plus 6 parity chunks: 15 chunks for 9 chunks of data, about 1.67x raw space, while tolerating the loss of 6 chunks. That strong protection suits data kept for a long time. RS(3,3) is 3 data plus 3 parity, 2x space, but with only 6 chunks per stripe, writing and reading are simpler and faster, which suits short-lived shuffle output that will be deleted soon.\n\nTectonic replacing Haystack and f4, Meta's hot and warm blob stores, is also notable. It means the separate tiered systems described in the f4 paper were eventually folded into one multitenant file system, with differences expressed through encoding and placement rather than separate storage products.",
+    "quiz": {
+      "q": "Why would Meta use RS(3,3) for shuffle output but RS(9,6) for long-lived warehouse data?",
+      "a": "Short-lived shuffle data favors simpler, faster coding with fewer chunks; long-lived data needs stronger durability at lower space overhead, which RS(9,6) gives."
+    }
+  },
+  {
+    "id": "ch07-026",
+    "chapter": 7,
+    "section": "7.3.3 Meta: the warehouse on Tectonic",
+    "title": "Multitenancy lets the warehouse borrow idle disk IO",
+    "body": "Tectonic shows a benefit of multitenancy, where several very different workloads share one storage system. Meta's warehouse and its blob storage (photos, videos and similar objects) ran as tenants on the same Tectonic clusters. During traffic spikes, the warehouse could use spare disk IO from the blob-storage tenant. Separate clusters would leave that idle IO stranded, while a shared system lets one tenant absorb another's unused capacity.",
+    "deeper": "Each workload has its own rhythm. Warehouse jobs are bursty, with heavy scans at certain times, while blob storage has different peaks. If each runs on its own dedicated cluster, each must be provisioned for its own peak, and the gap between peak and average is wasted.\n\nPooling resources in one system smooths this out. When the warehouse spikes, it can draw on IO that the blob tenant is not using at that moment. This is the same economic logic as consolidating many HDFS clusters into fewer Tectonic clusters: bigger pools waste less stranded capacity, whether that capacity is disk space or disk throughput.\n\nIt also ties back to the two-dimensional bin-packing problem Meta faced on HDFS. When clusters are small and isolated, leftover throughput in one cannot help another. In a large shared cluster, throughput becomes a fungible, shared resource. Google's Colossus reflects a similar goal, trying to keep disks both full and busy by placing hot and cold data together across its fleet.",
+    "quiz": {
+      "q": "How did multitenancy on Tectonic help Meta's warehouse during traffic spikes?",
+      "a": "The warehouse shared clusters with blob storage and could use the blob tenant's spare disk IO, instead of that throughput sitting idle in a separate cluster."
+    }
+  },
+  {
+    "id": "ch07-027",
+    "chapter": 7,
+    "section": "7.3.4 Google BigQuery: Capacitor on Colossus",
+    "title": "BigQuery's Capacitor reorders rows to compress better",
+    "body": "BigQuery is a fully managed warehouse: users never see files. Underneath, tables are stored in Capacitor, Google's internal columnar format, on Colossus, Google's cluster file system. Google described Capacitor in 2016. Beyond standard encodings like run-length and dictionary, a notable idea is row reordering. Finding the best row order for compression is NP-complete, so Capacitor uses a heuristic based on data types and query patterns to make run-length encoding work better.",
+    "deeper": "Run-length encoding stores a repeated value once along with how many times it repeats, so it shines when identical values sit next to each other. Row order therefore changes compression: sort a table so similar rows cluster together and runs get longer. Because rows are shared across all columns, the order that best helps one column may hurt another, and searching for the optimal order is NP-complete, meaning no known efficient exact algorithm exists at scale. Capacitor settles for a good heuristic guided by column types and how the table is queried.\n\nColossus provides the durability and security underneath: encryption at rest, Reed-Solomon coding and geo-replication. BigQuery also re-optimizes storage in the background, which is like automatic compaction and layout tuning that users never have to schedule.\n\nIn the comparison table, Google's reason is being fully managed, with storage fully hidden. That contrasts with open lakes, where teams like LinkedIn's must build platforms such as OpenHouse to run maintenance themselves.",
+    "quiz": {
+      "q": "Why does row order affect how well Capacitor compresses a table?",
+      "a": "Run-length encoding compresses runs of identical values; reordering rows groups similar values together, lengthening runs. The optimal order is NP-complete, so a heuristic is used."
+    }
+  },
+  {
+    "id": "ch07-028",
+    "chapter": 7,
+    "section": "7.3.4 Google BigQuery: Capacitor on Colossus",
+    "title": "Colossus quietly moves data from flash to disk as it ages",
+    "body": "Colossus also places data by temperature. Google wrote in 2021 that hot data goes on flash and data moves to larger-capacity disks as it ages, while trying to keep disks both full and busy. This is tiering inside the file system, invisible to the user. Applications and BigQuery users never pick a storage class; the system decides where bytes should live based on how actively they are used.",
+    "deeper": "The goal of keeping disks both full and busy captures the core tension of tiering. Large-capacity disks are cheap per byte but can serve only limited IOPS. Fill them only with cold data and they sit idle; fill them with hot data and they cannot keep up. Mixing temperatures sensibly uses both capacity and throughput, while flash absorbs the hottest reads.\n\nThis is the first of the two ways to tier that the chapter later describes: transparent tiering inside the storage system, as opposed to tiering exposed to customers as storage classes with different prices. With transparent tiering, the operator owns the decision and has direct visibility into access rates, so it can move data by actual IOPS per TB rather than guesses.\n\nMeta's f4 is another example of internal tiering, moving warm photos to a system with lower replication overhead. The chapter's comparison table lists internal tiering as moving by access and IOPS per TB, with retrieval fees not applicable, since it operates within the provider's own fleet.",
+    "quiz": {
+      "q": "Why does Colossus try to keep disks 'both full and busy' when placing data by temperature?",
+      "a": "Big disks are cheap per byte but IOPS-limited; mixing temperatures uses both capacity and throughput instead of leaving disks idle or overloaded."
+    }
+  },
+  {
+    "id": "ch07-029",
+    "chapter": 7,
+    "section": "7.3.5 Comparison",
+    "title": "Five lakes compared: Netflix, Uber, LinkedIn, Meta, Google",
+    "body": "Five companies, five choices. Netflix: Amazon S3 with Iceberg (created there) and Parquet, as a cloud-first company with separate compute. Uber: HDFS moving to GCS (announced 2024), with Hudi and Parquet, driven by mutable trip data and exiting data-center capital expense. LinkedIn: HDFS with Iceberg via OpenHouse, reflecting a large owned fleet and central table governance. Meta: Tectonic replacing HDFS, ORC-based formats, for exabyte scale and cluster consolidation. Google: Colossus with Capacitor in fully managed BigQuery.",
+    "deeper": "The comparison shows there is no single right lake. Each choice follows from the company's situation.\n\nNetflix was born in the cloud, so S3 was the natural storage layer, and the gaps in object-store semantics led it to invent Iceberg. Uber's data changes after it is written, so it needed Hudi for upserts on immutable HDFS; later, the cost of owning data centers pushed it toward GCS. LinkedIn owns a large fleet and chose to modernize the table layer, adding Iceberg governance with OpenHouse rather than migrating storage. Meta operates at exabyte scale and built Tectonic to collapse many HDFS clusters into far fewer. Google hides storage entirely behind BigQuery, pairing its own columnar format with its own file system.\n\nThe pattern across all five is the layered model: companies change the layer that hurts most. Sometimes that is the table format (Netflix, LinkedIn), sometimes storage (Uber, Meta), and sometimes the whole stack is vertically integrated (Google).",
+    "quiz": {
+      "q": "LinkedIn and Uber both started on HDFS. How did their modernization strategies differ?",
+      "a": "LinkedIn kept HDFS and added Iceberg governance via OpenHouse; Uber added Hudi for mutable data, then began moving storage itself to Google Cloud Storage."
+    }
+  },
+  {
+    "id": "ch07-030",
+    "chapter": 7,
+    "section": "7.4 Why data cools: the evidence",
+    "title": "Meta's f4 data: day-old content gets 100x more requests",
+    "body": "The best public evidence that data cools comes from Meta's f4 paper, OSDI 2014. It studied nine types of user BLOBs (Binary Large OBjects, such as photos, videos and attachments) using a two-week trace. For all nine types, content less than one day old received more than 100 times the request rate of one-year-old content. For eight of nine types, request rate dropped 10 times in under a week. For six types, it dropped 100 times within 60 days.",
+    "deeper": "These numbers show both how extreme and how fast cooling is. A 100-fold gap between a new object and a year-old one means treating them the same, on the same media and redundancy, wastes money on the old one or starves the new one.\n\nThe speed matters as much as the magnitude. A 10-fold drop within a week for eight of nine types means most of an object's lifetime demand happens almost immediately after upload. That is intuitive for social media: people view a new photo when it is posted, then rarely again.\n\nThe chapter calls this the core fact of storage economics: most data is cold, and it gets cold fast. A small hot part needs fast media; a large cold part needs cheap media. The lifecycle can be pictured as a sequence: a new photo is uploaded; it is hot, with many reads in the first day; reads drop about 10 times within a week; it becomes warm after about one to three months; then cold, rarely read but kept for years; and finally archived or deleted by retention policy.",
+    "quiz": {
+      "q": "What does the f4 trace imply about putting new and year-old BLOBs on the same storage?",
+      "a": "Demand differs by over 100x, so uniform storage either overspends on cold data or underserves hot data; each needs different media."
+    }
+  },
+  {
+    "id": "ch07-031",
+    "chapter": 7,
+    "section": "7.4 Why data cools: the evidence",
+    "title": "Hot-to-warm cutoffs: one month, three for photos, never for avatars",
+    "body": "Meta's f4 paper derived safe cutoffs for moving BLOBs from hot to warm storage. For most types, one month was safe. Ordinary photos used three months. Profile photos were never moved to warm storage, because they stay popular long after upload. The paper also found warm objects dominate: more than 80% of objects in the oldest interval studied, and more than 89% in the newest, were warm across all types. Most stored data is warm or colder.",
+    "deeper": "The cutoff is set per type, not globally, and that is the practical lesson. Different content cools at different speeds. Profile photos are displayed next to a user's activity everywhere, so they keep getting requests for about a year or more and keep too many requests per TB for warm storage. Ordinary photos cool more slowly than attachments or other content, hence their longer three-month window.\n\nThe one-month cutoff for most types came with a safety margin. Near-worst-case load dropped below warm-tier capacity within about a week, and delete rates also fall with age, so waiting a month meant objects were solidly cold and unlikely to be deleted soon after moving.\n\nThe 80% to 89% figures explain why warm storage matters so much financially. If most objects are warm, then the redundancy overhead of warm storage, not hot storage, dominates total cost. That is why Meta invested in f4, which cut effective replication from Haystack's 3.6x to 2.8x and later 2.1x.",
+    "quiz": {
+      "q": "What evidence from the f4 paper supports a one-month hot-to-warm cutoff, and why were profile photos never moved?",
+      "a": "Near-worst-case load fell below warm capacity (20 IOPS/TB) within a week and deletes decline with age, giving margin. Profile photos stayed popular about a year."
+    }
+  },
+  {
+    "id": "ch07-032",
+    "chapter": 7,
+    "section": "7.4 Why data cools: the evidence",
+    "title": "Warm storage is sized in IOPS per TB, about 20 for f4",
+    "body": "The hardware link behind tiering is IOPS, input/output operations per second. In f4, 4 TB disks delivered about 80 IOPS at acceptable latency. Divide 80 by 4 and each terabyte stored can serve about 20 IOPS, so warm storage was sized for about 20 IOPS per TB. Data can move to dense storage only once its request rate per TB falls below that level; otherwise the disks cannot keep up with reads.",
+    "deeper": "This turns tiering from a vague idea into arithmetic. A disk has a roughly fixed number of IOPS regardless of capacity. As disks get denser, the IOPS available per stored terabyte falls. A dense warm tier is cheap per byte precisely because it packs many bytes behind few IOPS.\n\nSo the question for any dataset is: how many requests per second does each terabyte of it receive? If the answer is above what the dense tier offers, around 20 IOPS per TB for f4, placing it there would overload the disks and latency would suffer. If below, it can move safely and save money.\n\nThis is why hot data needs flash or well-spread HDD. Spreading hot data thinly across many disks gives each terabyte more IOPS, at the cost of wasted capacity. Cooling data can be packed densely. It also explains why the same principle appears in Colossus, which tries to keep disks both full and busy by pairing IOPS-hungry hot data with capacity-hungry cold data.",
+    "quiz": {
+      "q": "Why could data move to f4's warm tier only after its requests per TB dropped below about 20?",
+      "a": "f4's 4 TB disks served about 80 IOPS, roughly 20 per TB; denser data with higher request rates would overload the disks and hurt latency."
+    }
+  },
+  {
+    "id": "ch07-033",
+    "chapter": 7,
+    "section": "7.4 Why data cools: the evidence",
+    "title": "Senior lens: temperature is IOPS per TB, age is only a proxy",
+    "body": "Temperature is a property of IOPS per TB, not of age. Age is only a proxy that often correlates with access. Meta measured when each BLOB type's near-worst-case load, the 99th percentile, dropped below warm-tier capacity, and set the cutoff per type. When you design tiering, measure access per type and per age bucket. Do not pick 30 days just because a cloud console suggests it as a default.",
+    "deeper": "Using the 99th percentile rather than the average matters. Averages hide spikes: a type might average well below warm capacity yet regularly burst above it, and when it does, latency collapses for everyone sharing those disks. Sizing to near-worst-case load keeps the warm tier safe during bursts.\n\nPer-type measurement matters because types cool at different rates. Profile photos never cooled enough; ordinary photos needed three months; most types needed one. A single global cutoff would either move profile photos too early and overload warm disks or keep other types hot too long and waste money.\n\nThe warning about defaults is practical. Cloud consoles and lifecycle templates often suggest round numbers like 30 days. Those are starting points, not facts about your workload. The same lens reappears later as a design-review question: ask for the access histogram, meaning bytes read in the last 7, 30, 90 and 365 days by object age, before accepting any tiering plan. Without measurement, tiering is guessing.",
+    "quiz": {
+      "q": "Why did Meta set tiering cutoffs using 99th-percentile load per BLOB type instead of a single average-based age?",
+      "a": "Averages hide bursts that would overload warm disks, and types cool at different rates, so per-type near-worst-case load gives safe, cost-effective cutoffs."
+    }
+  },
+  {
+    "id": "ch07-034",
+    "chapter": 7,
+    "section": "7.5 Storage tiering",
+    "title": "Hot, warm, cold, archive: four tiers of storage",
+    "body": "Storage tiering means storing data on different classes of media or service depending on how often it is read, and moving it between them over time. Common names: Hot data is read often and needs millisecond latency and high IOPS, on flash or well-spread HDD. Warm data is read sometimes but still needs fast first byte, on dense HDD, often more aggressively erasure-coded. Cold data is read rarely, on very dense HDD, sometimes powered down. Archive data is almost never read.",
+    "deeper": "Archive is the fourth tier: data read almost never, where retrieval in hours is fine. It lives on tape, powered-off disks or optical media.\n\nEach step down trades performance for cost along several axes at once. Media gets denser, with fewer IOPS per TB. Redundancy gets leaner, using wider erasure codes instead of replicas, as in Meta's move from Haystack's 3.6x effective replication to f4's 2.8x and then 2.1x. Power use drops, sometimes to zero when drives are spun down or tapes sit on shelves. Access latency rises from milliseconds to minutes or hours.\n\nThe key phrase is first byte, the delay before data starts arriving. Warm storage still needs fast first byte, meaning readers do not wait noticeably. Cold and archive tiers relax that. Knowing which tier a dataset needs therefore comes down to two questions: how often it is read, measured as IOPS per TB, and how long a reader can tolerate waiting for the first byte when it is read.",
+    "quiz": {
+      "q": "What distinguishes warm from archive storage in terms of what readers can tolerate?",
+      "a": "Warm data still needs fast first byte on dense HDD; archive data is almost never read, so retrieval taking hours from tape or powered-off disks is acceptable."
+    }
+  },
+  {
+    "id": "ch07-035",
+    "chapter": 7,
+    "section": "7.5.1 Two ways to tier",
+    "title": "Two ways to tier: hidden inside the system or sold as classes",
+    "body": "There are two ways to tier. First, inside the storage system, transparently: the system moves data between media or encodings on its own. Colossus puts hot data on flash and cooling data on disk, and Meta moved warm photos from Haystack (3.6x effective replication) to f4 (2.8x, then 2.1x). Second, exposed to the customer: cloud providers sell tiers as storage classes with different prices, chosen by the customer or by an automated feature.",
+    "deeper": "The two approaches put the decision in different hands. In transparent tiering, the operator sees actual access rates and can move data based on IOPS per TB, as Meta did with f4. Users never make choices, and there are no retrieval fees to optimize around, because the provider owns both the fleet and the bill.\n\nIn exposed tiering, the customer decides, either manually or via features like S3 Intelligent-Tiering and GCS Autoclass. The provider signals costs through prices: cheaper storage per GB, but retrieval fees, minimum durations and slower first byte. The customer must understand their access patterns to choose well, which is why break-even math matters.\n\nMeta's Haystack-to-f4 move shows what transparent tiering can save. Dropping effective replication from 3.6x to 2.1x means each byte of warm data needs far less raw disk. Given that f4's data showed more than 80% of objects were warm, applying lower overhead to that majority saved a large share of total storage.",
+    "quiz": {
+      "q": "What is the key difference between transparent tiering and tiering exposed as storage classes?",
+      "a": "Transparent tiering lets the storage system move data itself using its own access data; exposed tiering makes customers choose priced classes with retrieval fees and minimums."
+    }
+  },
+  {
+    "id": "ch07-036",
+    "chapter": 7,
+    "section": "7.5.2 The cost vs retrieval trade-off",
+    "title": "Every cooler tier: cheaper storage, pricier reads, minimum stay",
+    "body": "Every cooler storage tier makes the same deal: cheaper to store, more expensive to read, and a minimum stay. If you delete early, you still pay for the remaining days. Amazon S3 list prices in US East (N. Virginia), checked in 2026, illustrate this: Standard costs 0.023 dollars per GB-month for the first 50 TB, down to 0.021, while Glacier Deep Archive costs 0.0018, about 1 dollar per TB-month, with 12 to 48 hours to first byte.",
+    "deeper": "The full S3 ladder, per GB-month: Standard 0.023 down to 0.021, no retrieval fee, millisecond first byte, no minimum. Standard-IA 0.0125, per-GB retrieval fee, milliseconds, 30-day minimum. One Zone-IA 0.01, per-GB fee, milliseconds, 30 days. Glacier Instant Retrieval 0.004, per-GB fee, milliseconds, 90 days. Glacier Flexible Retrieval 0.0036, per-GB fee with bulk retrieval free, minutes to hours, 90 days. Glacier Deep Archive 0.0018, per-GB fee, 12 to 48 hours, 180 days.\n\nGlacier Flexible Retrieval offers three speeds: expedited in 1 to 5 minutes, standard in 3 to 5 hours, and free bulk in 5 to 12 hours.\n\nThe ratio is striking: Standard to Deep Archive is about 12 to 13 times cheaper per GB. But reading 1 GB back from a cool tier can cost as much as storing it for months. So tiering saves money only when data really is cold. Minimum durations add a trap: moving data to a cold class and deleting it soon after means paying for the full minimum anyway.",
+    "quiz": {
+      "q": "Why can moving data to a cooler S3 class increase costs even though storage is cheaper?",
+      "a": "Retrieval fees can equal months of storage per read, and minimum durations charge for remaining days if deleted early, so it only pays for truly cold data."
+    }
+  },
+  {
+    "id": "ch07-037",
+    "chapter": 7,
+    "section": "7.5.2 The cost vs retrieval trade-off",
+    "title": "Standard-IA break-even: read more than once a month and it loses",
+    "body": "When does S3 Standard-IA pay off? It saves about 0.0105 dollars per GB-month over Standard (0.023 minus 0.0125). Its retrieval fee is about 0.01 dollars per GB. So if an object is read in full more than about once per month, IA costs more than Standard. For a photo archive where photos older than three months are read far less than monthly, IA wins easily. For an analytics table scanned daily, it loses badly.",
+    "deeper": "The calculation generalizes to any tier: compare monthly storage savings per GB against expected monthly retrieval cost per GB. Break-even reads per month roughly equal the savings divided by the retrieval fee. For IA, 0.0105 divided by 0.01 is about one full read per month.\n\nWorked example from the chapter's quiz: an object read in full twice a month. Savings are about 0.0105 dollars per GB-month, but two reads cost about 2 x 0.01 = 0.02 dollars per GB. IA costs nearly double the savings, so keep it in Standard.\n\nThis is why the chapter's takeaways say to do the break-even math per data type. The same bucket can hold data that belongs in different tiers: old photos that are rarely viewed and derived tables scanned every morning. Minimum durations add another factor: IA's 30-day minimum means short-lived objects pay for a full month regardless. With an access histogram per type, these calculations become straightforward instead of guesses.",
+    "quiz": {
+      "q": "An object in S3 Standard-IA is read in full twice per month. Is IA cheaper than Standard? Show the math.",
+      "a": "No. IA saves about $0.0105/GB-month, but two reads cost about 2 x $0.01 = $0.02/GB. IA costs more; keep it in Standard."
+    }
+  },
+  {
+    "id": "ch07-038",
+    "chapter": 7,
+    "section": "7.5.2 The cost vs retrieval trade-off",
+    "title": "Azure archive is offline; GCS Archive answers in milliseconds",
+    "body": "Azure and Google offer the same tier shape as S3. Azure Blob Storage has hot, cool, cold and archive tiers: cool has a 30-day minimum, cold 90 days, archive 180 days. Azure archive is offline: a blob must be rehydrated, copied back to an online tier, before it can be read, which can take up to 15 hours. Google Cloud Storage has Standard, Nearline, Coldline and Archive, and GCS Archive is still online, with millisecond first byte.",
+    "deeper": "The key difference is whether the coldest tier is online. Azure archive, like S3 Glacier Deep Archive, is effectively offline: you must request data and wait hours before reading. Rehydration takes up to 15 hours, and applications must be designed to issue a request and come back later.\n\nGoogle takes a different approach. GCS Archive keeps millisecond first byte, so reading archived data works like reading any other object. You pay for that convenience with higher retrieval fees and a 365-day minimum storage duration, twice Azure's and S3 Deep Archive's 180 days.\n\nAzure charges early deletion pro-rata, so deleting archived data before its minimum means paying for the remaining days, the same minimum-stay trap as S3. Choosing between these depends on your read pattern. If archived data is truly never read except in disasters, an offline tier with slow retrieval is fine. If occasional reads must be immediate, an online archive like GCS's avoids redesigning applications around delayed retrieval, at a price.",
+    "quiz": {
+      "q": "What is the trade-off of GCS Archive being online compared with Azure's offline archive tier?",
+      "a": "GCS Archive gives millisecond reads without rehydration but charges higher retrieval fees and a 365-day minimum; Azure archive needs up to 15 hours rehydration."
+    }
+  },
+  {
+    "id": "ch07-039",
+    "chapter": 7,
+    "section": "7.5.3 Lifecycle rules",
+    "title": "Lifecycle rules: after N days, move to class X or delete",
+    "body": "A lifecycle rule is a policy on a storage bucket that says: after N days, move objects matching this prefix or tag to class X, or after M days, delete them. It runs automatically in the background. A typical S3 rule for event logs keeps events in Standard for 30 days, moves them to Standard-IA, then to Glacier Instant Retrieval at 90 days, to Deep Archive at 365 days, and deletes them after 2,555 days.",
+    "deeper": "In the chapter's running example, the rule is scoped with a filter on the prefix events/, and has three transitions plus an expiration. Its effect: events stay hot for a month, warm until 90 days, instantly readable until one year, then move to deep archive, and are deleted after about 7 years (2,555 days).\n\nThe shape follows the evidence about cooling: logs are read heavily right after they arrive, occasionally in the following weeks, and very rarely after that. Glacier Instant Retrieval between 90 and 365 days keeps millisecond access for the odd investigation while charging much less than Standard. Deep Archive handles the long tail at about 1 dollar per TB-month.\n\nThe expiration is as important as the transitions. It encodes a retention decision, deleting data when it is no longer needed, which saves more than any tier. Lifecycle rules are also the mechanism that platforms use to apply retention policies, translating a catalog of data types and their allowed ages into automatic transitions and deletes.",
+    "quiz": {
+      "q": "What does the expiration in the example event-log lifecycle rule accomplish that transitions alone do not?",
+      "a": "It deletes events after about 7 years, enforcing retention; transitions only make storage cheaper, while deletion removes the cost and risk entirely."
+    }
+  },
+  {
+    "id": "ch07-040",
+    "chapter": 7,
+    "section": "7.5.3 Lifecycle rules",
+    "title": "Lifecycle traps: transition fees, tiny objects, age isn't access",
+    "body": "Lifecycle rules are simple but have three traps. First, transition requests cost money: each object moved is a billed request, so billions of small objects can make transitions expensive. Second, very small objects may cost more in a cool class because of per-object overhead and minimum billable sizes, so batch them first. Third, age is not access: lifecycle rules move data by how old it is, not by whether anyone actually reads it.",
+    "deeper": "The first two traps both come from per-object costs. A lifecycle transition is billed per object, not per byte, so a bucket of billions of tiny log files can cost more to move than the storage savings justify. Cool classes also often charge minimum billable sizes and per-object overhead, which inflates the effective price of tiny objects. The fix is to combine small objects into larger ones, the same remedy as for the small-files problem, before tiering.\n\nThe third trap is conceptual. A lifecycle rule assumes old data is cold, but that is only a proxy. An old dataset that a monthly report scans will be moved to IA and then rack up retrieval fees, while a new object nobody reads stays in expensive Standard for 30 days. This echoes the earlier senior lens: temperature is IOPS per TB, not age.\n\nThe age-versus-access gap led providers to build access-based tiering, such as S3 Intelligent-Tiering and GCS Autoclass, which watch actual reads.",
+    "quiz": {
+      "q": "Why can lifecycle transitions be surprisingly expensive for a bucket of billions of small log files?",
+      "a": "Each transition is a billed per-object request, and cool classes add per-object overhead and minimum billable sizes, so costs scale with object count, not bytes."
+    }
+  },
+  {
+    "id": "ch07-041",
+    "chapter": 7,
+    "section": "7.5.4 Automatic tiering by access",
+    "title": "S3 Intelligent-Tiering moves each object by actual access",
+    "body": "S3 Intelligent-Tiering fixes the age-is-not-access problem by watching each object. After 30 days without access it moves to an Infrequent Access tier; after 90 days, to Archive Instant Access. Optional Archive Access (after at least 90 days) and Deep Archive Access (after at least 180 days) tiers can be enabled for data that tolerates retrieval delays. When an object in the Infrequent or Archive Instant tier is read, it moves back to Frequent Access automatically.",
+    "deeper": "The pricing model is the key difference from lifecycle rules. Intelligent-Tiering has no retrieval fee. Instead it charges a monitoring fee of 0.0025 dollars per 1,000 objects per month. This removes the risk of retrieval fees exploding if a dataset turns out to be read more than expected, since reading simply moves an object back to Frequent Access.\n\nThere is an important exception: objects smaller than 128 KB are not monitored and always stay in Frequent Access. Tiny objects therefore get no benefit, another reason to batch small files.\n\nThe monitoring fee is per object, so it favors fewer, larger objects. For a bucket of billions of tiny objects, monitoring could be expensive or pointless. The flow can be pictured as a decision loop: an object written to the Frequent tier is checked for reads in the last 30 days; if none, it drops to Infrequent; if no reads in 90 days, to Archive Instant; optionally further to Archive or Deep Archive after 90 to 180+ days. Any read sends it back up.",
+    "quiz": {
+      "q": "How does S3 Intelligent-Tiering avoid the retrieval-fee risk of lifecycle rules?",
+      "a": "It charges a per-object monitoring fee instead of retrieval fees, and a read automatically moves an object back to Frequent Access."
+    }
+  },
+  {
+    "id": "ch07-042",
+    "chapter": 7,
+    "section": "7.5.4 Automatic tiering by access",
+    "title": "GCS Autoclass and Azure smart tier: Google's and Microsoft's take",
+    "body": "GCS Autoclass does for Google what Intelligent-Tiering does for S3. Objects move to Nearline after 30 days without access, to Coldline after 90 days, and to Archive after 365 days if Archive is enabled as the terminal class. Reading an object's data moves it back to Standard. Objects under 128 KiB stay in Standard. Autoclass charges a management fee but no retrieval or early-deletion fees. Azure has lifecycle management policies and, more recently, a smart tier.",
+    "deeper": "Azure's smart tier moves data between hot, cool and cold automatically, the same idea as Autoclass and Intelligent-Tiering applied to Azure's tiers. Combined with Azure's lifecycle management policies, it offers both age-based and access-based options.\n\nThe chapter's comparison table summarizes the approaches. Lifecycle rules move by age, prefix and tag, charge retrieval fees, and suit predictable data like logs and backups. S3 Intelligent-Tiering moves per object by access, with a monitoring fee instead of retrieval fees, and suits unknown or mixed access. GCS Autoclass is the same, with a management fee. Internal tiering, as in Colossus or f4, moves by access and IOPS per TB, has no retrieval fees because it is the provider's own fleet, and is used there.\n\nThe rule of thumb follows: if you know your access pattern, lifecycle rules are cheaper and simpler; if you do not, access-based tiering avoids surprises. Both ignore small objects under about 128 KB, which is a key limitation noted in the takeaways.",
+    "quiz": {
+      "q": "When are plain lifecycle rules a better choice than access-based tiering like Autoclass?",
+      "a": "When data is predictable, like logs or backups, age reliably tracks access, so you avoid monitoring or management fees on every object."
+    }
+  },
+  {
+    "id": "ch07-043",
+    "chapter": 7,
+    "section": "7.5.4 Automatic tiering by access",
+    "title": "Senior lens: demand the access histogram before any tiering",
+    "body": "In a design review, ask for the access histogram: for each data type, how many bytes were read in the last 7, 30, 90 and 365 days, grouped by object age. Without it, tiering is guessing. With it, you can compute the break-even point for each tier: whether retrieval fees, minimum durations and monitoring fees are outweighed by the storage savings for that specific data type. It turns tiering from opinion into arithmetic.",
+    "deeper": "The histogram is the concrete form of the earlier principle that temperature is IOPS per TB, not age. Grouping reads by object age shows how quickly each type cools, just as Meta's f4 study did for its nine BLOB types. Grouping by type prevents one global rule from mistreating data that behaves differently, like profile photos versus attachments.\n\nThe time windows map to tier decisions. Reads in the last 7 days show what is truly hot. The 30- and 90-day windows line up with typical minimum durations and the thresholds used by Intelligent-Tiering and Autoclass. The 365-day window reveals whether anything is read after a year, which determines whether deep archive or even deletion is appropriate.\n\nWith those numbers, you can apply the Standard-IA break-even: if bytes in a type are read in full more than about once a month, IA loses. You can also spot types where most bytes are never read at all, which raises the more valuable question from the retention section: why keep them?",
+    "quiz": {
+      "q": "Why group the access histogram by object age and data type rather than using one overall read rate?",
+      "a": "Types cool at different speeds, and age grouping shows when each crosses tier break-evens; a single average hides both and leads to wrong cutoffs."
+    }
+  },
+  {
+    "id": "ch07-044",
+    "chapter": 7,
+    "section": "7.6 Archival",
+    "title": "Archival: keep it for decades, read it almost never",
+    "body": "Archival is storage for data you must keep but expect almost never to read. Examples include backups, legal holds, raw sensor data, old media masters and financial records. The goals are lowest cost per TB-year, very high durability and long media life. Latency measured in hours is acceptable. Because reads are so rare, archives can use slow media like tape, powered-down disks or experimental glass, trading access speed for cost and longevity.",
+    "deeper": "Archival differs from cold storage mainly in expectations. Cold data might be read occasionally; archive data is kept primarily as insurance or for obligations, such as a court order, a regulator, or a disaster recovery plan.\n\nThat changes what matters. Cost per TB-year, rather than per GB-month, reflects the long horizons involved. Durability must be very high because data may sit untouched for decades, and nobody will notice corruption unless something checks. Media life matters because a medium that fails or becomes unreadable in five years forces repeated copying, which the chapter calls the hidden archive cost.\n\nLatency in hours opens design space. Robots can fetch tapes, drives can stay powered off until needed, reads can be batched, and entire datacenters can be built without backup power, as Meta did for cold storage. The options surveyed next range from cloud archive services with prices near 1 dollar per TB-month, through tape and powered-down disks, to Microsoft's research on glass.",
+    "quiz": {
+      "q": "Why is 'cost per TB-year' a better metric than 'cost per GB-month' for archival storage?",
+      "a": "Archive data is kept for years or decades, so total long-horizon cost, including durability and media life, matters more than a short monthly price."
+    }
+  },
+  {
+    "id": "ch07-045",
+    "chapter": 7,
+    "section": "7.6.1 Cloud archive services",
+    "title": "Cloud archive services and the mystery of their media",
+    "body": "The main cloud archive services differ in speed and minimums. Amazon S3 Glacier Deep Archive: 12 to 48 hours to first byte, about 1 dollar per TB-month, 180-day minimum, launched 2019. Amazon S3 Glacier Flexible Retrieval: minutes to 12 hours, 0.0036 dollars per GB-month, the original Glacier service launched 2012. Google Cloud Storage Archive: milliseconds, online, 365-day minimum. Azure Blob Archive: up to 15 hours to rehydrate, offline, 180-day minimum.",
+    "deeper": "A notable caution: AWS, Google and Microsoft do not publish which media their archive tiers use. Be careful with blog posts that claim to know. The service shape only tells us something indirect: retrieval delays of hours leave room for robotic media like tape libraries, powered-down drives, or batching many reads together before touching the media.\n\nThis matters for accuracy in design discussions. It is tempting to assume that Glacier is tape, for example, but that is not publicly confirmed. What you can reason about is the service contract: first-byte latency, minimum duration, storage price and retrieval fees.\n\nThe contrast between GCS Archive and the others is also a design signal. Millisecond first byte means the data is on media that can be read quickly, while Azure and Deep Archive's hours-long delays imply the provider can use slower, cheaper arrangements. Choosing a service is about matching that contract to how, and how urgently, you expect to read your archive, and to how long you will keep it given the minimums.",
+    "quiz": {
+      "q": "What can you actually infer about the media behind cloud archive tiers?",
+      "a": "Only indirect clues: providers don't publish media, but hours-long retrieval leaves room for robotic media like tape, powered-down drives, or batched reads."
+    }
+  },
+  {
+    "id": "ch07-046",
+    "chapter": 7,
+    "section": "7.6.2 Tape at hyperscalers",
+    "title": "Tape: cheap, powerless on a shelf, and air-gapped",
+    "body": "Magnetic tape, today mostly LTO (Linear Tape-Open), is the oldest archive media still in wide use. It has three strengths: very low cost per TB of media; no power needed while a cartridge sits on a shelf; and an air gap, meaning a cartridge in a library slot cannot be deleted by ransomware or a software bug. Its weakness is access time: a robot loads the cartridge and the drive winds to the right spot.",
+    "deeper": "Loading and winding takes tens of seconds to minutes, far too slow for anything interactive but fine for archives where hours are acceptable.\n\nThe air gap is tape's most distinctive strength. Online systems, however well replicated, can be reached by software. A malicious actor or buggy code with write access can delete or encrypt every online copy. A cartridge sitting in a slot is physically disconnected, so nothing can alter it until it is loaded.\n\nThe market is still growing. The LTO Program reported 152.9 EB of new LTO capacity shipped in 2023 and 176.5 EB in 2024; these are compressed-capacity figures, meaning they assume data compression and overstate raw capacity. LTO-10 was introduced in 2025.\n\nThe main risk, per the chapter's media comparison, is that drive generations become obsolete. An LTO drive reads only a few generations back, so data on old cartridges must eventually be copied forward to newer media, part of the hidden migration cost of any archive.",
+    "quiz": {
+      "q": "What does tape's air gap protect against that replicated online storage cannot?",
+      "a": "A cartridge sitting in a slot is disconnected, so ransomware or buggy software cannot delete or corrupt it, unlike online replicas software can reach."
+    }
+  },
+  {
+    "id": "ch07-047",
+    "chapter": 7,
+    "section": "7.6.2 Tape at hyperscalers",
+    "title": "Gmail 2011: a bug wiped replicas, tape brought mail back",
+    "body": "Public evidence of tape inside hyperscalers is limited. The best-known case is Google. In February 2011, a software bug deleted Gmail data for a small share of users. Google restored it from tape backups, and its blog said it backs Gmail up to tape to protect against exactly such bugs. The lesson: replicas protect against hardware loss, but a software bug replicates instantly to every copy. Only an offline, separate copy protects against that.",
+    "deeper": "This incident is the clearest illustration of why replication is not backup. Replication keeps multiple synchronized copies so that a failed disk, server or even datacenter does not lose data. But synchronization works both ways: if software deletes or corrupts data, that change propagates to every replica, often within seconds. All copies are then equally wrong.\n\nAn offline copy breaks that chain. Because tapes are written separately and sit disconnected, the bug cannot reach them. Restoring from tape is slow, which is why Google's post described Gmail as back soon rather than immediately, but it is possible.\n\nThe chapter points to its later backup chapter for more on this. The practical takeaway for design reviews: when someone says data is safe because it has three replicas, ask what happens if the application deletes it. Replicas and erasure coding answer the hardware question; only separate, preferably air-gapped copies answer the software question. Features like S3 Object Lock provide a similar protection by blocking deletion until a set date.",
+    "quiz": {
+      "q": "Why couldn't Gmail's replicas protect against the 2011 data-deletion bug?",
+      "a": "A software bug's deletions replicate instantly to every copy; only a separate, offline copy like tape was untouched and could restore the data."
+    }
+  },
+  {
+    "id": "ch07-048",
+    "chapter": 7,
+    "section": "7.6.3 Meta's cold storage datacenters",
+    "title": "Meta's cold storage halls: one exabyte, a sixth of the power",
+    "body": "Meta, then Facebook, built dedicated cold storage datacenters in Prineville, Oregon and Forest City, North Carolina, described in 2015. Each data hall could hold up to one exabyte while using less than one-sixth of the power of Meta's normal datacenters. UPS systems and generators were removed entirely, because cold data can wait if power fails. Only one drive per tray was powered on at a time, cutting power per rack dramatically.",
+    "deeper": "A rack held 2 PB on 4 TB drives and used about one-quarter the power of normal storage servers. With most drives spun down, both power draw and cooling needs fall sharply.\n\nDurability came from software rather than hardware redundancy. Reed-Solomon coding stored each 1 GB as 10 data chunks plus 4 parity chunks, 1.4 GB in total, so data survives the loss of any 4 chunks. A scanner checked every drive about every 30 days for silent corruption, bit rot that no one would otherwise notice because the data is rarely read.\n\nRemoving UPS and generators was safe because availability was not the goal. If power fails, cold data is temporarily unreachable, but nobody urgently needs it, and erasure coding across drives and racks keeps it durable even when some hardware is offline. In the media comparison, powered-down HDD access takes seconds to minutes, uses almost no power at rest, lasts about 5 years, and its main risk is a drive failing to spin up.",
+    "quiz": {
+      "q": "Why did Meta remove UPS and generators from its cold storage datacenters, and what made this safe?",
+      "a": "Cold data can wait for power to return, so constant availability wasn't needed; erasure coding across drives and racks kept data durable with hardware offline."
+    }
+  },
+  {
+    "id": "ch07-049",
+    "chapter": 7,
+    "section": "7.6.3 Meta's cold storage datacenters",
+    "title": "Design the whole datacenter for one temperature",
+    "body": "Meta's cold storage is a good example of designing an entire datacenter for one data temperature. By accepting that cold data can wait, Meta removed power redundancy, powered most drives off, and cut power per rack. The software made these hardware compromises safe: erasure coding protected against unavailable or failed drives, and read scheduling directed requests to the one drive powered on in each tray. Hardware and software were designed together around the workload.",
+    "deeper": "The general principle is that relaxing one requirement can unlock savings everywhere else. Normal datacenters are built for constant availability: redundant power, every drive spinning, low latency. Cold data does not need any of that, so a facility built only for cold data can shed all that cost.\n\nThe software side is what makes the bargain work. Because only one drive per tray is powered at a time, reads must be scheduled so the system powers the right drive and batches requests rather than thrashing between drives. Erasure coding with 10 data plus 4 parity chunks means data survives drives that are off, failed or unreachable. The 30-day scanner catches silent corruption before it accumulates beyond what parity can repair.\n\nThis mirrors tiering logic at a larger scale. Where tiering moves data to cheaper media, Meta built cheaper buildings. It also connects to the archive theme: the longer and colder the data, the more you can trade access speed for cost, provided durability is handled carefully in software.",
+    "quiz": {
+      "q": "How did software make Meta's cold-storage hardware compromises safe?",
+      "a": "Erasure coding tolerated offline or failed drives, a scanner caught silent corruption, and reads were scheduled to the single powered drive per tray."
+    }
+  },
+  {
+    "id": "ch07-050",
+    "chapter": 7,
+    "section": "7.6.3 Meta's cold storage datacenters",
+    "title": "Meta's Blu-ray rack: a prototype, not a proven product",
+    "body": "Meta also showed a Blu-ray optical disc cold storage rack as a prototype at the Open Compute Summit in 2014, pitched as cheaper and lower-power than disk-based cold storage. The chapter could not find a primary Meta source with verified capacity and savings figures, so it does not repeat numbers that circulated in the press. Optical should be treated as an experiment: Meta did not publish long-term production results for it.",
+    "deeper": "The chapter adds that Meta's later FAST 2021 paper describes Tectonic as the system that replaced Haystack and f4 for blob storage, with no mention of optical as a production tier. That is further reason to see the Blu-ray rack as a prototype rather than a lasting part of Meta's storage hierarchy.\n\nIn the archive media comparison, optical (Blu-ray prototype) has access times of seconds to minutes, uses no power at rest, claims media life of decades, and its main risks are low density and limited adoption.\n\nThe broader lesson is about evidence. Storage media claims often spread through press coverage and blog posts with numbers that cannot be traced to a primary source. The chapter deliberately withholds such figures, the same caution it applies to claims about which media cloud archive tiers use. When evaluating archive technology, prefer published production results and papers over demos and announcements, and treat unsupported figures as unverified. A prototype shows possibility; long-term production data shows viability.",
+    "quiz": {
+      "q": "Why does the chapter treat Meta's Blu-ray cold storage rack as an experiment rather than a proven design?",
+      "a": "No primary Meta source verifies capacity or savings, no long-term production results were published, and Tectonic later replaced its blob stores without optical."
+    }
+  },
+  {
+    "id": "ch07-051",
+    "chapter": 7,
+    "section": "7.6.4 Glass: Microsoft Project Silica",
+    "title": "Project Silica: writing data into glass with lasers",
+    "body": "Project Silica is Microsoft Research's work on storing data in quartz glass. A femtosecond laser, one with extremely short pulses, writes tiny 3D changes called voxels in layers inside a glass platter. A microscope reads them using polarized light, and machine learning decodes the image back into bits. The glass is expected to last thousands of years or more, so data would never need copying to new media. It is research, not a product.",
+    "deeper": "Microsoft has published several facts. A platter about the size of a DVD has raw capacity above 7 TB. Magnetic media requires copying data to new media every 5 to 10 years, but glass is expected to last thousands of years, removing that need. A 2023 SOSP paper described a full library design with separate read, write and storage racks and robotic shuttles moving platters between them. Once written, glass cannot be overwritten. The design met a 15-hour service level objective for archive reads, even with read drives of only 30 MB/s. A proof of concept with Warner Bros. was announced in 2019.\n\nThe write-once property is a double-edged feature: it protects against accidental or malicious modification, similar to tape's air gap, but means deletions must be handled differently. The separation of read, write and storage racks means expensive writers and readers are shared across many passive platters. Silica shows where archive design is going: media needing no power, no refresh and no migration.",
+    "quiz": {
+      "q": "How does the Silica library meet a 15-hour read SLO despite read drives of only 30 MB/s?",
+      "a": "Archive reads are rare, so separate read racks and robotic shuttles bring platters to shared drives; a 15-hour objective leaves ample time."
+    }
+  },
+  {
+    "id": "ch07-052",
+    "chapter": 7,
+    "section": "7.6.5 Archive media comparison",
+    "title": "Archive media head to head: disk, tape, optical, glass",
+    "body": "Four archive media compared. Powered-down HDD, as in Meta's cold storage: seconds to minutes access, almost no power at rest, about 5 years of life, main risk a drive failing to spin up. Tape (LTO): tens of seconds to minutes, no power, decades if stored well, risk that drive generations become obsolete. Optical (Blu-ray prototype): seconds to minutes, no power, claimed decades, low density and limited adoption. Glass (Silica research): hours in the library design, no power, thousands of years claimed, not yet a product.",
+    "deeper": "Reading across the table reveals the real trade-offs. Access time varies but is always slow compared with online storage, which is fine for archives. Power at rest is nearly zero for all of them, which is the core cost advantage over spinning disks.\n\nThe differences lie in lifetime and risk. Powered-down disks are the most familiar technology but have the shortest life, about 5 years, and a drive that has been idle may fail to spin up when finally needed. Tape lasts decades physically, but the practical limit is readers: drives read only a few generations back. Optical claims long life but never achieved wide adoption or high density. Glass claims the longest life by far but is research.\n\nThe common thread is that media life alone is not enough; you also need working readers. That is why the next idea, migration cost, dominates long-term archive economics. The Main risk column is the most useful for design reviews, because it names what will actually cause data loss or expense decades from now.",
+    "quiz": {
+      "q": "Tape cartridges can last decades. Why is that not enough to avoid copying tape archives?",
+      "a": "LTO drives read only a few generations back, so readers become obsolete before the media wears out, forcing migration to newer formats."
+    }
+  },
+  {
+    "id": "ch07-053",
+    "chapter": 7,
+    "section": "7.6.6 Migration is the hidden archive cost",
+    "title": "Migration: the hidden cost that eats archive budgets",
+    "body": "Archive readers become obsolete. An LTO drive reads only a few generations back, and hard drives last about five years. So an archive must be re-copied to new media several times over a 30-year retention period. At exabyte scale, each migration is a major project: reading everything back, writing it to new media, and verifying it. The cloud provider handling this for you is a big reason cloud archive is attractive.",
+    "deeper": "Removing migration is the main promise of glass storage like Project Silica, whose platters are expected to last thousands of years, so data can be written once and never migrated.\n\nThe cost is hidden because it does not appear when you first store data. The price per TB-month on day one does not include the future labor, hardware and risk of copying everything forward every five to ten years. Over a long retention period, those migrations can rival or exceed the media cost itself.\n\nMigrations also carry risk: every copy is a chance to lose or corrupt data, and they compete for the same limited read throughput archives are designed around. A 30-year retention on media lasting 5 to 10 years means three to six full migrations.\n\nThis changes the build-versus-buy calculation. A company running its own tape archive must plan and staff these migrations; a cloud archive customer pays a monthly price and the provider absorbs them. When comparing archive options, include migration in the total cost of ownership.",
+    "quiz": {
+      "q": "Why is media migration a hidden cost of archival, and how does Project Silica aim to remove it?",
+      "a": "Magnetic media lasts about 5 to 10 years and readers become obsolete, forcing repeated copies; glass lasts thousands of years, so data is written once and never migrated."
+    }
+  },
+  {
+    "id": "ch07-054",
+    "chapter": 7,
+    "section": "7.7 Retention policies",
+    "title": "Retention: a minimum from law, a maximum from privacy and cost",
+    "body": "Tiering decides where data lives; retention decides how long it lives. A retention policy is a rule stating how long each type of data must be kept, the minimum, and when it must be deleted, the maximum. Both limits matter. Minimum retention comes from law and business: financial records, audit logs, legal holds. Maximum retention comes from privacy law and cost: every day you keep unneeded data costs money and increases breach risk.",
+    "deeper": "GDPR's storage-limitation principle means personal data should not be kept longer than needed, which makes maximum retention a legal requirement for personal data, not just a cost optimization.\n\nThe chapter describes a typical flow for enforcing retention. Data is created with a type tag. A retention catalog maps each type to its minimum and maximum days. The platform applies lifecycle rules and TTLs (time to live) based on that catalog. Before deleting, it checks whether a legal hold is active. If yes, it keeps the data and blocks deletion. If no, data is tiered down over time, then deleted at its maximum age, and the deletion is recorded in an audit log.\n\nIn the running example, raw click events might be deleted after 2 years for cost and privacy, audit logs kept 7 years for compliance, and photos kept until the user deletes them, per the user contract. These are illustrative, not legal advice. For the minimum side, S3 Object Lock and Azure immutable blob storage block deletion until a date.",
+    "quiz": {
+      "q": "Where do the minimum and maximum limits of a retention policy come from?",
+      "a": "Minimums come from law and business needs like financial records, audits and legal holds; maximums come from privacy law such as GDPR plus cost and breach risk."
+    }
+  },
+  {
+    "id": "ch07-055",
+    "chapter": 7,
+    "section": "7.7 Retention policies",
+    "title": "Object Lock and immutable blobs: enforcing the minimum",
+    "body": "For the minimum side of retention, providers offer immutability features such as S3 Object Lock and Azure immutable blob storage. These block deletion of data until a set date, so nothing, not a mistaken script, a careless administrator or ransomware, can remove it early. They protect against both human mistakes and malicious deletion, making retention minimums a technical guarantee rather than a policy that depends on everyone following the rules.",
+    "deeper": "Immutability features complement the retention flow. When the platform's catalog says audit logs must be kept 7 years, a lock can ensure that no one, including those with write access, can delete them before the date. Legal holds work similarly: while a hold is active, data is kept and deletion is blocked.\n\nThe protection against ransomware is significant. Ransomware typically encrypts or deletes data and demands payment; if the data cannot be deleted or overwritten until a date, the attack cannot destroy those copies. This parallels tape's air gap and the Gmail lesson: replicas protect against hardware failure, but software, whether buggy or malicious, can reach every online copy unless something blocks it.\n\nThe flip side is that immutability must be applied carefully. Data locked for a long period cannot be removed to honor the maximum side of retention or a user's deletion request until the lock expires. Designing retention means setting both limits deliberately per data type, using the catalog, lifecycle rules, locks and audit logs together.",
+    "quiz": {
+      "q": "How do features like S3 Object Lock help against ransomware?",
+      "a": "They block deletion or overwriting until a set date, so malicious software cannot destroy locked copies even with write access."
+    }
+  },
+  {
+    "id": "ch07-056",
+    "chapter": 7,
+    "section": "7.7 Retention policies",
+    "title": "Common mistake: deleting raw data but not its copies",
+    "body": "A common mistake is setting a deletion rule on the raw data but not on its copies. A deleted event still lives on in derived tables, ML training sets, backups and caches. Retention has to follow the lineage, the chain of datasets built from the original. Otherwise the policy is enforced on paper while the data survives elsewhere. LinkedIn's OpenHouse builds retention into the table platform itself for exactly this reason.",
+    "deeper": "Data in a lake rarely stays in one place. A single click event may flow into a sessionized table, then a daily active users table, an ad report and an ML training set, plus backups and caches along the way. Deleting it from the raw event log after 2 years accomplishes little if the derived copies persist indefinitely.\n\nThis matters for both cost and compliance. On cost, derived tables may be as large as the raw data. On compliance, privacy rules like GDPR's storage limitation apply to personal data wherever it lives, so a forgotten copy can still violate the maximum retention requirement.\n\nFollowing lineage requires knowing what was derived from what, and applying policy consistently across all of it. That is hard to do team by team, which is why LinkedIn put retention, data purging and partition expiration into OpenHouse alongside compaction and snapshot expiration. When retention is a platform service, every table registered with it gets policies applied automatically, rather than depending on each team to remember.",
+    "quiz": {
+      "q": "Why doesn't deleting raw event data after 2 years fully enforce a retention policy?",
+      "a": "Copies persist in derived tables, ML training sets, backups and caches; retention must follow lineage to every dataset built from the original."
+    }
+  },
+  {
+    "id": "ch07-057",
+    "chapter": 7,
+    "section": "7.7 Retention policies",
+    "title": "Senior lens: the cheapest byte is the byte you deleted",
+    "body": "The cheapest byte is the byte you deleted. Before building a clever tiering system, ask: why are we keeping this at all? At most companies, a retention review saves more than any tiering project. Tiering can cut storage cost by about 12 to 13 times at best between S3 Standard and Deep Archive, but deletion cuts it to zero and also removes breach risk, migration cost and compliance exposure.",
+    "deeper": "The comparison is stark once framed this way. Tiering reduces the price per byte; retention reduces the number of bytes. A dataset moved to Deep Archive still costs about 1 dollar per TB-month forever, still must be migrated to new media over decades, and still counts as stored personal data for privacy purposes. A deleted dataset costs nothing.\n\nTiering is also where engineering effort tends to go, because it is a technical challenge. Retention is a policy question that requires talking to legal, product and data owners, which is harder organizationally but often yields bigger savings.\n\nThe chapter's takeaways reinforce this: retention policies with both minimum and maximum limits, applied across all copies, save more money and risk than tiering alone. In practice, the two work together. The retention catalog sets how long each type lives; lifecycle rules tier data down during that window and delete it at the end. But the first question in any design review of a growing storage bill should be which data does not need to exist.",
+    "quiz": {
+      "q": "Why might a retention review save more than a sophisticated tiering project?",
+      "a": "Tiering only lowers price per byte, while deletion removes bytes entirely, eliminating storage, migration, breach and compliance costs rather than just shrinking them."
+    }
+  },
+  {
+    "id": "ch07-058",
+    "chapter": 7,
+    "section": "Key takeaways",
+    "title": "Chapter 7 in ten lines: lakes, tiers, archives, retention",
+    "body": "The chapter's core lessons: a data lake separates storage from compute, optimizing for cheap, high-throughput bytes. HDFS lakes hit NameNode memory and 3x replication limits; object stores remove those but lose locality and atomic rename, which table formats replace. Small files are permanent, so compaction must be a platform service. Data cools fast, and temperature means IOPS per TB. Cooler tiers need break-even math. Archive media wins on cost but hides migration costs. Retention beats tiering.",
+    "deeper": "Several company-specific takeaways anchor these lessons. Uber announced in 2024 a move of its more-than-1-exabyte Hadoop lake to Google Cloud, starting by swapping HDFS for GCS behind the same API. Meta instead replaced HDFS with its own Tectonic and cut warehouse clusters by 10 times. Meta's f4 data showed request rates falling 10 times within a week for most BLOB types, and more than 80% of objects warm in older intervals.\n\nOn tiering mechanics: move data to dense media when its access rate falls below what that media can serve. Cooler tiers trade lower storage prices for retrieval fees, minimum durations and slower first byte, so do the math per data type. Access-based tiering such as S3 Intelligent-Tiering and GCS Autoclass fixes the age-is-not-access problem but ignores objects under 128 KB.\n\nOn archives: tape, powered-down disk and glass research win on cost and power, but migrating to new media is a hidden long-term cost. On retention: set both minimum and maximum limits and apply them across all copies, since that saves more money and risk than tiering alone.",
+    "quiz": {
+      "q": "What limitation do S3 Intelligent-Tiering and GCS Autoclass share regarding small objects?",
+      "a": "Objects under about 128 KB are not monitored or moved; they stay in the frequent or standard tier, so tiny files gain nothing."
+    }
+  }
+]
