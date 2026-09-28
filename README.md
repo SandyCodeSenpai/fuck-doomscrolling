@@ -1,9 +1,10 @@
 # Fuck Doomscrolling
 
-A Twitter-style feed of 60–100 word technical concept cards, scheduled with spaced repetition. Static PWA, no build step.
+Daily sessions of 60–100 word technical concept cards, one per screen, scheduled with spaced repetition. Twitter look, static PWA, no build step.
 
-- **Again / Got it** rate your recall. **Deeper** expands more detail. **Save** bookmarks it.
-- The feed rotates across chapters (least-covered first, never the same chapter twice in a row) and slots in due reviews as quiz cards.
+- Each day: all due reviews (as quiz cards) + N new cards (Progress → New cards a day), then a finish line with a streak.
+- **Again / Got it** rate your recall (only rated cards count as learned). Again brings the card back a few cards later. **Deeper** opens more detail. **Save** bookmarks it.
+- New cards come in book order by default (or Mix chapters); untick chapters in Progress to skip them.
 
 ## Files
 - `cards/chNN.json` – cards per chapter (written by agents from the book, per `CARD_SPEC.md`)

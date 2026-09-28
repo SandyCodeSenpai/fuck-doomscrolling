@@ -1,6 +1,6 @@
 // node test.mjs
 import assert from 'node:assert/strict';
-import { review, nextBatch, merge, DAY, MIN } from './srs.js';
+import { review, nextBatch, merge, MIN } from './srs.js';
 
 const now = 1e12;
 let s = review({}, 'good', now);
@@ -9,8 +9,6 @@ s = review(s, 'good', now); assert.equal(s.ivl, 3);
 s = review(s, 'good', now); assert.equal(s.ivl, 8); // 3 * 2.5 rounded
 s = review(s, 'again', now);
 assert.equal(s.due, now + 10 * MIN); assert.equal(s.reps, 0); assert.equal(s.ease, 2.3);
-assert.equal(review({}, 'seen', now).due, now + DAY);
-assert.equal(review(s, 'seen', now), s); // seen never reschedules a scheduled card
 
 const cards = [];
 for (const ch of [1, 2, 3]) for (let i = 0; i < 5; i++) cards.push({ id: `ch${ch}-${i}`, topic: 'storage', chapter: ch });
@@ -31,6 +29,11 @@ const st = { 'ch3-4': { due: now - 1, u: 1 } };
 const b2 = nextBatch(cards, st, { now, n: 6, order: 'mix' });
 assert.equal(b2[2].mode, 'review'); assert.equal(b2[2].card.id, 'ch3-4');
 assert.equal(b2.filter(x => x.card.id === 'ch3-4').length, 1);
+
+// daily session: all due reviews + at most maxNew new cards
+const day = nextBatch(cards, { 'ch3-4': { due: now - 1, u: 1 }, 'ch3-3': { due: now - 1, u: 1 } }, { now, maxNew: 4 });
+assert.equal(day.filter(x => x.mode === 'new').length, 4);
+assert.equal(day.filter(x => x.mode === 'review').length, 2);
 
 // recently shown cards are skipped; everything exhausted -> short batch
 const recent = new Map(cards.map(c => [c.id, now]));

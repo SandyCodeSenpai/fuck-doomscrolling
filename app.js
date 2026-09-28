@@ -1,23 +1,33 @@
-import { review, nextBatch, merge, groupOf } from './srs.js';
+import { review, nextBatch, merge, groupOf, DAY } from './srs.js';
 import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
 
 const KEY = 'fds.v1';
-let state = {}; // card id -> srs state (see srs.js)
+let state = {}; // card id -> srs state (see srs.js), plus '_settings' and '_day'
 try { state = JSON.parse(localStorage.getItem(KEY)) ?? {}; } catch {}
 const cards = await (await fetch('cards.json')).json();
 const view = document.getElementById('view');
-const recent = new Map();
-let lastGroup = null, lastNewGroup = null, tab = 'feed';
+const sheet = document.getElementById('sheet');
+const count = document.getElementById('count');
+const meter = document.querySelector('#meter i');
+let tab = 'today', touched = false; // touched: rated something since the deck was built
+
 // position of each card inside its chapter, e.g. 12/65
 const chapterSize = {};
 for (const c of cards) c.pos = chapterSize[groupOf(c)] = (chapterSize[groupOf(c)] ?? 0) + 1;
 
-// Settings live in state under '_settings' so they sync and merge like card state.
-const settings = () => ({ order: 'book', off: [], ...state._settings });
-const setSettings = patch => set('_settings', { ...settings(), ...patch, u: Date.now() });
-
 function persist() { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch {} }
 function set(id, s) { state[id] = s; persist(); scheduleSync(); }
+
+// Settings and the daily tally live in state so they sync and merge like card state.
+const settings = () => ({ order: 'book', off: [], perDay: 15, ...state._settings });
+const setSettings = patch => set('_settings', { ...settings(), ...patch, u: Date.now() });
+const dateOf = ms => new Date(ms).toLocaleDateString('en-CA'); // YYYY-MM-DD, local time
+function day() {
+  const d = state._day ?? {};
+  return d.date === dateOf(Date.now()) ? d : { streak: d.streak ?? 0, last: d.last, date: dateOf(Date.now()), newCount: 0, reviewCount: 0 };
+}
+const setDay = patch => set('_day', { ...day(), ...patch, u: Date.now() });
+const streak = () => ([dateOf(Date.now()), dateOf(Date.now() - DAY)].includes(day().last) ? day().streak : 0);
 
 function h(tag, cls, text) {
   const el = document.createElement(tag);
@@ -40,28 +50,28 @@ function actionBtn(kind, label) {
   return b;
 }
 
-const seenObserver = new IntersectionObserver(entries => {
-  for (const e of entries) {
-    if (!e.isIntersecting) continue;
-    const id = e.target.dataset.id;
-    if (!state[id]?.due) set(id, review(state[id], 'seen'));
-    seenObserver.unobserve(e.target);
-  }
-}, { threshold: 0.6 });
+sheet.onclick = e => e.target === sheet && sheet.close(); // tap the backdrop to close
+sheet.querySelector('.close').onclick = () => sheet.close();
+function openDeeper(card) {
+  sheet.querySelector('h3').textContent = card.title;
+  sheet.querySelector('.text').textContent = card.deeper;
+  sheet.showModal();
+  sheet.querySelector('.text').scrollTop = 0;
+}
 
-function cardEl({ card, mode }) {
+// onRate(grade, first) is called after a rating is saved; first = the first rating of this card view.
+function cardEl({ card, mode }, onRate = () => {}) {
   const before = state[card.id] ?? {}; // ratings apply to the state at render, so switching Again<->Got it doesn't stack
   const el = h('article');
   el.dataset.id = card.id;
+  const top = h('div', 'top');
   const avatar = h('div', 'avatar', card.chapter);
   avatar.style.background = `hsl(${(card.chapter * 47) % 360} 65% 42%)`;
-  const content = h('div', 'content');
   const meta = h('div', 'meta');
-  meta.append(h('b', null, card.topicName), ` · Ch ${card.chapter} · ${card.pos}/${chapterSize[groupOf(card)]} · ${card.chapterTitle}`);
-  content.append(meta);
+  meta.append(h('b', null, card.chapterTitle), h('span', null, `Ch ${card.chapter} · ${card.pos}/${chapterSize[groupOf(card)]} · ${card.section}`));
+  top.append(avatar, meta);
+  const content = h('div', 'content');
 
-  const deeper = h('div', 'deeper', card.deeper);
-  deeper.hidden = true;
   const actions = h('div', 'actions');
   const [again, good, deep, save] = [
     actionBtn('again', 'Again'), actionBtn('good', 'Got it'), actionBtn('deep', 'Deeper'), actionBtn('save', 'Save'),
@@ -69,14 +79,17 @@ function cardEl({ card, mode }) {
   actions.append(again, good, deep, save);
   save.classList.toggle('on', !!before.saved);
 
+  let rated = false;
   const rate = grade => {
     set(card.id, { ...review(before, grade), saved: state[card.id]?.saved ?? 0 });
     again.classList.toggle('on', grade === 'again');
     good.classList.toggle('on', grade === 'good');
+    onRate(grade, !rated);
+    rated = true;
   };
   again.onclick = () => rate('again');
   good.onclick = () => rate('good');
-  deep.onclick = () => deep.classList.toggle('on', !(deeper.hidden = !deeper.hidden));
+  deep.onclick = () => openDeeper(card);
   save.onclick = () => {
     const s = state[card.id] ?? {};
     set(card.id, { ...s, saved: s.saved ? 0 : Date.now(), u: Date.now() });
@@ -86,19 +99,86 @@ function cardEl({ card, mode }) {
   if (mode === 'review') {
     content.append(h('span', 'pill', 'Review'), h('h2', null, card.quiz.q));
     const reveal = h('button', 'reveal', 'Show answer');
-    actions.hidden = true;
+    actions.classList.add('locked'); // rate only after trying to recall
     reveal.onclick = () => {
-      reveal.replaceWith(h('div', 'answer', card.quiz.a), h('div', 'body', `${card.title}\n\n${card.body}`));
-      actions.hidden = false;
+      reveal.replaceWith(h('div', 'answer', card.quiz.a), h('div', 'body muted', `${card.title}\n\n${card.body}`));
+      actions.classList.remove('locked');
     };
     content.append(reveal);
   } else {
     content.append(h('h2', null, card.title), h('div', 'body', card.body));
-    seenObserver.observe(el);
   }
-  content.append(deeper, h('div', 'section', card.section), actions);
-  el.append(avatar, content);
+  el.append(top, content, actions);
   return el;
+}
+
+// Today: one card per screen (CSS scroll-snap), today's due reviews + up to perDay new cards, then a finish line.
+const slideObserver = new IntersectionObserver(entries => {
+  for (const e of entries) if (e.isIntersecting) onSlide(e.target);
+}, { root: view, threshold: 0.6 });
+
+function addSlide(item) { // returns the slide; the caller places it
+  const el = cardEl(item, (grade, first) => {
+    touched = true;
+    if (first) {
+      if (item.mode === 'new') setDay({ newCount: day().newCount + 1 });
+      else setDay({ reviewCount: day().reviewCount + 1 });
+      // Again: see it once more later today, as a quiz, a few cards from now
+      if (grade === 'again') {
+        let ref = el;
+        for (let i = 0; i < 4 && !ref.nextElementSibling.classList.contains('done'); i++) ref = ref.nextElementSibling;
+        ref.after(addSlide({ card: item.card, mode: 'review' }));
+      }
+    }
+    setTimeout(() => el.nextElementSibling?.scrollIntoView({ behavior: 'smooth' }), 350);
+  });
+  el.classList.add('slide');
+  slideObserver.observe(el);
+  return el;
+}
+
+function onSlide(el) {
+  const slides = [...view.querySelectorAll('article.slide:not(.done)')];
+  const i = slides.indexOf(el);
+  const done = el.classList.contains('done');
+  count.textContent = slides.length ? `${done ? slides.length : i + 1} / ${slides.length}` : '';
+  meter.style.width = `${slides.length ? (100 * (done ? slides.length : i)) / slides.length : 100}%`;
+  if (done) finish(el);
+}
+
+function finish(el) {
+  const d = day(), learned = d.newCount + d.reviewCount;
+  if (learned && d.last !== d.date) setDay({ streak: streak() + 1, last: d.date });
+  const tomorrow = cards.filter(c => state[c.id]?.due <= Date.now() + DAY).length;
+  el.replaceChildren();
+  const box = h('div', 'finish');
+  box.append(
+    h('div', 'flame', `🔥 ${streak()}`),
+    h('strong', null, learned ? 'Done for today.' : view.querySelector('article.slide:not(.done)') ? 'Swipe back up and rate a card.' : 'Nothing due right now.'),
+    h('p', null, `${d.newCount} new · ${d.reviewCount} reviewed today`),
+    h('p', 'muted', `${tomorrow} review${tomorrow === 1 ? '' : 's'} lined up for tomorrow. Close the app, you earned it.`),
+  );
+  const more = h('button', 'more', '5 more cards');
+  more.onclick = () => {
+    const shown = new Map([...view.querySelectorAll('article.slide:not(.done)')].map(s => [s.dataset.id, Date.now()]));
+    const { order, off } = settings();
+    const extra = nextBatch(cards, state, { order, off, maxNew: 5, n: 5, recent: shown });
+    if (!extra.length) return more.replaceWith(h('p', 'muted', 'You’ve seen every card in your chapters. Impressive.'));
+    const first = extra.map(item => view.insertBefore(addSlide(item), el))[0];
+    first.scrollIntoView({ behavior: 'smooth' });
+  };
+  box.append(more);
+  el.append(box);
+}
+
+function renderToday() {
+  view.classList.add('deck');
+  const { order, off, perDay } = settings();
+  const items = nextBatch(cards, state, { order, off, maxNew: Math.max(0, perDay - day().newCount) });
+  for (const item of items) view.append(addSlide(item));
+  const done = h('article', 'slide done');
+  view.append(done);
+  slideObserver.observe(done);
 }
 
 function empty(title, text) {
@@ -107,34 +187,22 @@ function empty(title, text) {
   return d;
 }
 
-// Feed: infinite scroll, a new batch when the sentinel nears the viewport.
-const sentinel = h('div');
-const feedObserver = new IntersectionObserver(e => e[0].isIntersecting && appendBatch(), { rootMargin: '1000px' });
-function appendBatch() {
-  const { order, off } = settings();
-  const batch = nextBatch(cards, state, { recent, lastGroup, order, off });
-  for (const item of batch) {
-    recent.set(item.card.id, Date.now());
-    const g = groupOf(item.card);
-    if (order === 'book' && item.mode === 'new' && g !== lastNewGroup) {
-      lastNewGroup = g;
-      const d = h('div', 'divider', `Chapter ${item.card.chapter}`);
-      d.append(h('span', null, `${item.card.chapterTitle} · from card ${item.card.pos} of ${chapterSize[g]}`));
-      view.insertBefore(d, sentinel);
-    }
-    view.insertBefore(cardEl(item), sentinel);
-  }
-  if (batch.length) lastGroup = groupOf(batch.at(-1).card);
-  else {
-    feedObserver.disconnect();
-    sentinel.replaceWith(empty('You’re all caught up.', 'Nothing new or due right now. Go touch grass, reviews will be waiting.'));
-  }
-}
-
 function renderSaved() {
   const saved = cards.filter(c => state[c.id]?.saved).sort((a, b) => state[b.id].saved - state[a.id].saved);
   if (!saved.length) return view.append(empty('Save cards for later', 'Tap the bookmark on any card and it lands here.'));
   for (const card of saved) view.append(cardEl({ card, mode: 'new' }));
+}
+
+function segmented(label, options, current, onPick) {
+  const seg = h('div', 'seg');
+  seg.append(h('span', null, label));
+  for (const [value, text] of options) {
+    const b = h('button', null, text);
+    b.setAttribute('aria-pressed', current === value);
+    b.onclick = () => { onPick(value); render(); };
+    seg.append(b);
+  }
+  return seg;
 }
 
 function renderProgress() {
@@ -143,22 +211,19 @@ function renderProgress() {
   const seen = c => !!st(c).due, mastered = c => st(c).ivl >= 21;
   const stats = h('div', 'stats');
   for (const [n, label] of [
-    [`${cards.filter(seen).length}/${cards.length}`, 'Seen'],
+    [`${cards.filter(seen).length}/${cards.length}`, 'Learned'],
     [cards.filter(c => st(c).due <= now).length, 'Due now'],
     [cards.filter(mastered).length, 'Mastered'],
+    [`🔥 ${streak()}`, 'Day streak'],
   ]) { const d = h('div', null, label); d.prepend(h('b', null, n)); stats.append(d); }
   view.append(stats, syncBox());
 
-  const { order, off } = settings();
-  const seg = h('div', 'seg');
-  seg.append(h('span', null, 'Feed order'));
-  for (const [value, label] of [['book', 'Book order'], ['mix', 'Mix chapters']]) {
-    const b = h('button', null, label);
-    b.setAttribute('aria-pressed', order === value);
-    b.onclick = () => { setSettings({ order: value }); render(); };
-    seg.append(b);
-  }
-  view.append(seg, h('div', 'hint', 'Untick a chapter to drop it (and its reviews) from your feed.'));
+  const { order, off, perDay } = settings();
+  view.append(
+    segmented('New cards a day', [5, 10, 15, 20, 30].map(n => [n, n]), perDay, v => setSettings({ perDay: v })),
+    segmented('Order', [['book', 'Book'], ['mix', 'Mix chapters']], order, v => setSettings({ order: v })),
+    h('div', 'hint', 'Untick a chapter to drop it (and its reviews) from your sessions.'),
+  );
 
   const groups = Map.groupBy(cards, groupOf);
   for (const [key, list] of groups) {
@@ -184,11 +249,14 @@ function renderProgress() {
 }
 
 function render() {
-  feedObserver.disconnect();
+  slideObserver.disconnect();
   view.replaceChildren();
-  window.scrollTo(0, 0);
-  lastNewGroup = null;
-  if (tab === 'feed') { view.append(sentinel); feedObserver.observe(sentinel); }
+  view.classList.remove('deck');
+  view.scrollTop = 0;
+  touched = false;
+  count.textContent = '';
+  meter.parentElement.hidden = tab !== 'today';
+  if (tab === 'today') renderToday();
   else if (tab === 'saved') renderSaved();
   else renderProgress();
 }
@@ -213,6 +281,7 @@ async function pull() {
   if (error) return console.warn('sync pull failed', error);
   state = merge(state, data?.data);
   persist();
+  if (tab === 'today' && !touched) render(); // rebuild today's deck with cloud progress (e.g. a new device)
   await push();
 }
 function syncBox() {
