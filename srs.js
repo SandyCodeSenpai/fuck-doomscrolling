@@ -17,10 +17,14 @@ export function review(s = {}, grade, now = Date.now()) {
 export const groupOf = c => `${c.topic}:${c.chapter}`;
 
 // Next n feed items: [{card, mode: 'new' | 'review'}].
-// New cards come from the least-covered chapter (never the same chapter twice in a row), in book order,
-// so every chapter advances evenly. Every 3rd slot is a due review (every 2nd if the backlog is big).
+// order 'book': new cards straight through the book, chapter by chapter.
+// order 'mix': from the least-covered chapter, never the same chapter twice in a row.
+// Chapters in `off` (group keys) are skipped entirely, reviews included.
+// Every 3rd slot is a due review (every 2nd if the backlog is big).
 // recent: Map id -> ms shown this session; those are skipped for 5 minutes.
-export function nextBatch(cards, state, { now = Date.now(), n = 15, recent = new Map(), lastGroup = null } = {}) {
+export function nextBatch(cards, state, { now = Date.now(), n = 15, recent = new Map(), lastGroup = null, order = 'book', off = [] } = {}) {
+  const skip = new Set(off);
+  cards = cards.filter(c => !skip.has(groupOf(c)));
   const fresh = id => !(now - (recent.get(id) ?? -Infinity) < 5 * MIN);
   const due = cards.filter(c => state[c.id]?.due <= now && fresh(c.id)).sort((a, b) => state[a.id].due - state[b.id].due);
   const groups = new Map();
@@ -43,7 +47,7 @@ export function nextBatch(cards, state, { now = Date.now(), n = 15, recent = new
     }
     if (!open.length) break;
     const pool = open.length > 1 ? open.filter(g => g.key !== lastGroup) : open;
-    const g = pool.reduce((a, b) => (b.seen / b.total < a.seen / a.total ? b : a));
+    const g = order === 'book' ? open[0] : pool.reduce((a, b) => (b.seen / b.total < a.seen / a.total ? b : a));
     out.push({ card: g.queue.shift(), mode: 'new' });
     g.seen++;
     lastGroup = g.key;

@@ -7,7 +7,14 @@ try { state = JSON.parse(localStorage.getItem(KEY)) ?? {}; } catch {}
 const cards = await (await fetch('cards.json')).json();
 const view = document.getElementById('view');
 const recent = new Map();
-let lastGroup = null, tab = 'feed';
+let lastGroup = null, lastNewGroup = null, tab = 'feed';
+// position of each card inside its chapter, e.g. 12/65
+const chapterSize = {};
+for (const c of cards) c.pos = chapterSize[groupOf(c)] = (chapterSize[groupOf(c)] ?? 0) + 1;
+
+// Settings live in state under '_settings' so they sync and merge like card state.
+const settings = () => ({ order: 'book', off: [], ...state._settings });
+const setSettings = patch => set('_settings', { ...settings(), ...patch, u: Date.now() });
 
 function persist() { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch {} }
 function set(id, s) { state[id] = s; persist(); scheduleSync(); }
@@ -50,7 +57,7 @@ function cardEl({ card, mode }) {
   avatar.style.background = `hsl(${(card.chapter * 47) % 360} 65% 42%)`;
   const content = h('div', 'content');
   const meta = h('div', 'meta');
-  meta.append(h('b', null, card.topicName), ` · Ch ${card.chapter} · ${card.chapterTitle}`);
+  meta.append(h('b', null, card.topicName), ` · Ch ${card.chapter} · ${card.pos}/${chapterSize[groupOf(card)]} · ${card.chapterTitle}`);
   content.append(meta);
 
   const deeper = h('div', 'deeper', card.deeper);
@@ -104,9 +111,17 @@ function empty(title, text) {
 const sentinel = h('div');
 const feedObserver = new IntersectionObserver(e => e[0].isIntersecting && appendBatch(), { rootMargin: '1000px' });
 function appendBatch() {
-  const batch = nextBatch(cards, state, { recent, lastGroup });
+  const { order, off } = settings();
+  const batch = nextBatch(cards, state, { recent, lastGroup, order, off });
   for (const item of batch) {
     recent.set(item.card.id, Date.now());
+    const g = groupOf(item.card);
+    if (order === 'book' && item.mode === 'new' && g !== lastNewGroup) {
+      lastNewGroup = g;
+      const d = h('div', 'divider', `Chapter ${item.card.chapter}`);
+      d.append(h('span', null, `${item.card.chapterTitle} · from card ${item.card.pos} of ${chapterSize[g]}`));
+      view.insertBefore(d, sentinel);
+    }
     view.insertBefore(cardEl(item), sentinel);
   }
   if (batch.length) lastGroup = groupOf(batch.at(-1).card);
@@ -134,12 +149,33 @@ function renderProgress() {
   ]) { const d = h('div', null, label); d.prepend(h('b', null, n)); stats.append(d); }
   view.append(stats, syncBox());
 
+  const { order, off } = settings();
+  const seg = h('div', 'seg');
+  seg.append(h('span', null, 'Feed order'));
+  for (const [value, label] of [['book', 'Book order'], ['mix', 'Mix chapters']]) {
+    const b = h('button', null, label);
+    b.setAttribute('aria-pressed', order === value);
+    b.onclick = () => { setSettings({ order: value }); render(); };
+    seg.append(b);
+  }
+  view.append(seg, h('div', 'hint', 'Untick a chapter to drop it (and its reviews) from your feed.'));
+
   const groups = Map.groupBy(cards, groupOf);
-  for (const list of groups.values()) {
+  for (const [key, list] of groups) {
     const c0 = list[0], s = list.filter(seen).length, m = list.filter(mastered).length;
-    const row = h('div', 'chapter');
+    const row = h('label', 'chapter');
+    row.classList.toggle('off', off.includes(key));
     const top = h('div', 'row');
-    top.append(h('div', null, `${c0.chapter}. ${c0.chapterTitle}`), h('span', null, `${s}/${list.length} · ${m} mastered`));
+    const box = h('input');
+    box.type = 'checkbox';
+    box.checked = !off.includes(key);
+    box.onchange = () => {
+      setSettings({ off: box.checked ? off.filter(k => k !== key) : [...off, key] });
+      render();
+    };
+    const name = h('div', 'name', `${c0.chapter}. ${c0.chapterTitle}`);
+    name.prepend(box);
+    top.append(name, h('span', null, `${s}/${list.length} · ${m} mastered`));
     const bar = h('div', 'bar');
     bar.innerHTML = `<i style="width:${(100 * s) / list.length}%"></i><i style="width:${(100 * m) / list.length}%"></i>`;
     row.append(top, bar);
@@ -151,6 +187,7 @@ function render() {
   feedObserver.disconnect();
   view.replaceChildren();
   window.scrollTo(0, 0);
+  lastNewGroup = null;
   if (tab === 'feed') { view.append(sentinel); feedObserver.observe(sentinel); }
   else if (tab === 'saved') renderSaved();
   else renderProgress();
@@ -203,6 +240,10 @@ function syncBox() {
   box.append(form);
   return box;
 }
+render();
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+
+// Loaded after the first render so a slow or offline CDN never blocks the feed.
 if (SUPABASE_URL) {
   try {
     const { createClient } = await import('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm');
@@ -211,10 +252,8 @@ if (SUPABASE_URL) {
       user = session?.user ?? null;
       // setTimeout: supabase-js deadlocks if its own calls run inside this callback
       if (user && (event === 'INITIAL_SESSION' || event === 'SIGNED_IN')) setTimeout(pull);
+      if (tab === 'progress') render();
     });
     document.addEventListener('visibilitychange', () => user && (document.hidden ? push() : pull()));
   } catch (e) { console.warn('sync unavailable (offline?)', e); }
 }
-
-render();
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
