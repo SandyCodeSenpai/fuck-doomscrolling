@@ -1,15 +1,16 @@
 # Fuck Doomscrolling
 
-Daily sessions of 60–100 word technical concept cards, one per screen, scheduled with spaced repetition. Twitter look, static PWA, no build step.
+Daily learning sessions that feel like a feed: storage-infrastructure concepts from a handbook, one card per screen, with spaced repetition. Twitter look, static PWA, no build step.
 
-- Each day: all due reviews (as quiz cards) + N new cards (Progress → New cards a day), then a finish line with a streak.
-- **Again / Got it** rate your recall (only rated cards count as learned). Again brings the card back a few cards later. **Deeper** opens more detail. **Save** bookmarks it.
-- New cards come in book order by default (or Mix chapters); untick chapters in Progress to skip them.
+- **Episodes:** 5 new cards (hook → tap to reveal; some ask you to guess first), then a quick multiple-choice check on those 5. Only the check schedules a card. Misses come back a few cards later.
+- **Reviews:** multiple choice while a card is young, free recall (Forgot / Knew it) once it's mature. Capped at 40/day; more than that = catch-up day with no new cards.
+- **Finish line:** streak (one missed day a week forgiven), week dots, today's haul, "you now know", tomorrow's teaser, max 2 bonus episodes.
+- Progress: retention % from real answers, per-chapter mastery, episodes/day, book order vs mix, sound, chapter on/off.
 
 ## Files
-- `cards/chNN.json` – cards per chapter (written by agents from the book, per `CARD_SPEC.md`)
+- `cards/chNN.json` – cards per chapter, written by agents from the book per `WRITING_STANDARD.md` (house style + card contract), fact-checked per `VERIFY_SPEC.md` (reports in `verify/`)
 - `build.py` – validates and merges them into `cards.json`, which the app loads
-- `srs.js` – scheduler + feed picker (`node test.mjs` tests it)
+- `srs.js` – scheduler, session builder, streak (`node test.mjs` tests it)
 - `app.js`, `index.html`, `sw.js`, `manifest.webmanifest` – the PWA
 
 ## Run locally

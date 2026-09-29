@@ -1,62 +1,91 @@
-// Spaced repetition + feed picking. Pure functions, no DOM (tested by test.mjs).
+// Spaced repetition + session building. Pure functions, no DOM (tested by test.mjs).
 export const MIN = 60e3, DAY = 864e5;
 
-// s: per-card state {ease, ivl (days), reps, lapses, due (ms), saved (ms|0), u (ms, last change)}
-// grade: 'again' | 'good'. A card only counts as learned once rated; skipping changes nothing.
-// ponytail: SM-2-lite with two grades; swap in FSRS if intervals feel off.
-export function review(s = {}, grade, now = Date.now()) {
-  let { ease = 2.5, ivl = 0, reps = 0, lapses = 0 } = s;
+// Local calendar day number (days since epoch in local time).
+export const dayNum = (ms = Date.now()) => Math.floor((ms - new Date(ms).getTimezoneOffset() * MIN) / DAY);
+
+// s: per-card state {ease, ivl (days), reps, lapses, due (ms), last (ms), saved (ms|0), u (ms), h: [[day, 0|1, kind]]}
+// grade 'again' | 'good'. easy: a fast correct answer, lets ease recover. kind: 'm' mcq, 'r' recall.
+// ponytail: SM-2-lite; the h log is kept so this can move to FSRS once there's enough data.
+export function review(s = {}, grade, { now = Date.now(), easy = false, kind = 'r', rand = Math.random } = {}) {
+  const { ease = 2.5, ivl = 0, reps = 0, lapses = 0, last } = s;
+  const h = [...(s.h ?? []), [dayNum(now), grade === 'good' ? 1 : 0, kind]].slice(-20);
   if (grade === 'again') {
-    return { ...s, ease: Math.max(1.3, ease - 0.2), ivl: 0, reps: 0, lapses: lapses + 1, due: now + 10 * MIN, u: now };
+    // forgetting keeps 30% of the interval instead of starting over; the session re-asks it in a few cards
+    const kept = ivl ? Math.max(1, Math.round(ivl * 0.3)) : 0;
+    return { ...s, ease: Math.max(1.3, ease - 0.2), ivl: kept, reps: kept >= 3 ? 2 : 0, lapses: lapses + 1, due: now + DAY, last: now, u: now, h };
   }
-  ivl = reps === 0 ? 1 : reps === 1 ? 3 : Math.round(ivl * ease);
-  return { ...s, ease, ivl, reps: reps + 1, lapses, due: now + ivl * DAY, u: now };
+  const elapsed = last ? (now - last) / DAY : 0; // answered late and still knew it -> credit the real gap
+  let next = reps === 0 ? 1 : reps === 1 ? 3 : Math.round(Math.max(ivl, elapsed) * ease * (0.95 + 0.1 * rand()));
+  if (reps >= 2) next = Math.max(next, ivl + 1);
+  const e = easy ? Math.min(2.8, ease + 0.05) : ease;
+  return { ...s, ease: e, ivl: next, reps: reps + 1, lapses, due: now + next * DAY, last: now, u: now, h };
 }
 
 export const groupOf = c => `${c.topic}:${c.chapter}`;
+const isNew = (state, c) => !state[c.id]?.due;
 
-// Next feed items: [{card, mode: 'new' | 'review'}], at most n in total and maxNew new ones.
-// order 'book': new cards straight through the book, chapter by chapter.
-// order 'mix': from the least-covered chapter, never the same chapter twice in a row.
-// Chapters in `off` (group keys) are skipped entirely, reviews included.
-// Every 3rd slot is a due review (every 2nd if the backlog is big).
-// recent: Map id -> ms shown this session; those are skipped for 5 minutes.
-export function nextBatch(cards, state, { now = Date.now(), n = Infinity, maxNew = Infinity, recent = new Map(), lastGroup = null, order = 'book', off = [] } = {}) {
-  const skip = new Set(off);
-  cards = cards.filter(c => !skip.has(groupOf(c)));
-  const fresh = id => !(now - (recent.get(id) ?? -Infinity) < 5 * MIN);
-  const due = cards.filter(c => state[c.id]?.due <= now && fresh(c.id)).sort((a, b) => state[a.id].due - state[b.id].due);
+// One day's session: [{card, mode: 'new' | 'check' | 'review'}].
+// - Reviews: due cards, most overdue (relative to interval) first, capped at reviewCap.
+//   If more than reviewCap are due it's a catch-up day: no new cards.
+// - Episodes: epSize new cards from one chapter (book order, or least-covered chapter for 'mix'),
+//   followed by a check round on exactly those cards, shuffled. Only the check schedules a new card.
+// - Reviews are spread between episodes so the session alternates.
+export function buildSession(cards, state, {
+  now = Date.now(), episodes = 2, epSize = 5, reviewCap = 40, order = 'book', off = [], skip = new Set(), rand = Math.random,
+} = {}) {
+  const offSet = new Set(off);
+  const on = cards.filter(c => !offSet.has(groupOf(c)) && !skip.has(c.id));
+  const overdue = c => (now - state[c.id].due) / Math.max(state[c.id].ivl ?? 1, 1);
+  const allDue = on.filter(c => state[c.id]?.due <= now).sort((a, b) => overdue(b) - overdue(a));
+  const catchUp = allDue.length > reviewCap;
+  const due = allDue.slice(0, reviewCap);
+
   const groups = new Map();
-  for (const c of cards) {
+  for (const c of on) {
     const g = groups.get(groupOf(c)) ?? { key: groupOf(c), total: 0, seen: 0, queue: [] };
     g.total++;
-    if (state[c.id]?.due) g.seen++;
-    else if (fresh(c.id)) g.queue.push(c);
+    if (isNew(state, c)) g.queue.push(c); else g.seen++;
     groups.set(g.key, g);
   }
-  const out = [];
-  const reviewEvery = due.length > 30 ? 2 : 3;
-  let newTaken = 0;
-  while (out.length < n) {
-    const open = newTaken < maxNew ? [...groups.values()].filter(g => g.queue.length) : [];
-    if (due.length && ((out.length + 1) % reviewEvery === 0 || !open.length)) {
-      const card = due.shift();
-      out.push({ card, mode: 'review' });
-      lastGroup = groupOf(card);
-      continue;
-    }
+  const eps = [];
+  let last = null;
+  for (let e = 0; e < (catchUp ? 0 : episodes); e++) {
+    const open = [...groups.values()].filter(g => g.queue.length);
     if (!open.length) break;
-    const pool = open.length > 1 ? open.filter(g => g.key !== lastGroup) : open;
+    const pool = open.length > 1 ? open.filter(g => g.key !== last) : open;
     const g = order === 'book' ? open[0] : pool.reduce((a, b) => (b.seen / b.total < a.seen / a.total ? b : a));
-    out.push({ card: g.queue.shift(), mode: 'new' });
-    newTaken++;
-    g.seen++;
-    lastGroup = g.key;
+    const ep = g.queue.splice(0, epSize);
+    g.seen += ep.length;
+    last = g.key;
+    eps.push(ep);
   }
-  return out;
+
+  const shuffle = a => { a = [...a]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+  const per = Math.ceil(due.length / (eps.length + 1));
+  const items = [];
+  for (const ep of eps) {
+    items.push(...due.splice(0, per).map(card => ({ card, mode: 'review' })));
+    items.push(...ep.map(card => ({ card, mode: 'new' })));
+    items.push(...shuffle(ep).map(card => ({ card, mode: 'check' })));
+  }
+  items.push(...due.map(card => ({ card, mode: 'review' })));
+  return { items, catchUp };
 }
 
-// Merge two {id: state} maps (local vs cloud): newest change per card wins.
+// Streak in days, from the list of day numbers with a completed session.
+// Today not done yet doesn't break it, and one missed day per 7 is forgiven.
+export function streakOf(days, today) {
+  const done = new Set(days);
+  let d = done.has(today) ? today : today - 1, n = 0, gap = Infinity;
+  for (;;) {
+    if (done.has(d)) { n++; d--; }
+    else if ((n || d === today - 1) && gap - d >= 7 && done.has(d - 1)) { gap = d; d--; }
+    else return n;
+  }
+}
+
+// Merge two {id: state} maps (local vs cloud): newest change per key wins.
 export function merge(a = {}, b = {}) {
   const out = { ...a };
   for (const [id, s] of Object.entries(b)) if (!out[id] || (s.u ?? 0) > (out[id].u ?? 0)) out[id] = s;

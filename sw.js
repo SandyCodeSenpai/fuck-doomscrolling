@@ -1,5 +1,5 @@
 // Offline: serve from cache instantly, refresh the cache in the background (stale-while-revalidate).
-const CACHE = 'fds-v4';
+const CACHE = 'fds-v5';
 const SHELL = ['./', 'index.html', 'app.js', 'srs.js', 'config.js', 'cards.json', 'manifest.webmanifest', 'icon.svg', 'icon-192.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL))); self.skipWaiting(); });
 self.addEventListener('activate', e => e.waitUntil(clients.claim()));
